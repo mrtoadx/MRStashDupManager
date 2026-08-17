@@ -6,6 +6,13 @@ description: >-
 version: 1.1.0
 url: https://github.com/mrtoadx/MRStashDupManager
 
+# Serve the plugin's assets/ folder over HTTP so the UI can poll the
+# generated dup_status.json / dup_report.json at
+#   /plugin/MRStashDupManager/assets/<file>
+# Without this block the files are written to disk but return 404.
+assets:
+  urlPrefix: assets
+
 ui:
   javascript:
     - MRStashDupManager.js
