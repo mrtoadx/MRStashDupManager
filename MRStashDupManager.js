@@ -103,13 +103,21 @@
     );
   }
 
-  async function renameFileBasename(fileId, newBasename) {
-    // Rename in place (same folder), just changing the basename.
+  async function renameFileBasename(fileId, currentFolder, newBasename) {
+    // Rename in place: moveFiles REQUIRES a destination folder even when only
+    // the basename changes ("must specify destination folder or path"), so we
+    // pass the file's existing folder to keep it in the same directory.
     return gqlQuery(
       `mutation MoveFiles($input: MoveFilesInput!) {
         moveFiles(input: $input)
       }`,
-      { input: { ids: [fileId], destination_basename: newBasename } }
+      {
+        input: {
+          ids: [fileId],
+          destination_folder: currentFolder,
+          destination_basename: newBasename,
+        },
+      }
     );
   }
 
@@ -168,9 +176,10 @@
   // rename would overflow the filesystem name limit.
   async function deleteSceneFileSafely(member) {
     if (member.file_id && deleteWouldOverflow(member.path)) {
+      const folder = dirname(member.path);
       const shortName = shortenBasename(basename(member.path));
-      LOG("Filename too long for soft-delete; renaming first:", basename(member.path), "→", shortName);
-      await renameFileBasename(member.file_id, shortName);
+      LOG("Filename too long for soft-delete; renaming first:", basename(member.path), "→", shortName, "in", folder);
+      await renameFileBasename(member.file_id, folder, shortName);
     }
     await destroyScene(member.scene_id, true);
   }
@@ -210,6 +219,12 @@
 
   function basename(p) {
     return (p || "").split(/[\\/]/).pop();
+  }
+
+  function dirname(p) {
+    const s = (p || "").replace(/[\\/]+$/, "");
+    const i = s.search(/[\\/][^\\/]*$/);
+    return i >= 0 ? s.slice(0, i) : "";
   }
 
   function fmtBytes(n) {
