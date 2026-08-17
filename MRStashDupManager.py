@@ -14,6 +14,30 @@ DUPLICATE_TAG_NAME = "_DuplicateMarkForDeletion"
 EXCLUDE_TAG_NAME = "_DuplicateExclude"
 
 # ---------------------------------------------------------------------------
+# Matching presets — mirror Stash's native Scene Duplicate Checker dropdowns
+# ---------------------------------------------------------------------------
+# Search accuracy -> phash hamming distance
+#   Exact = 0, High = 3, Medium = 6, Low = 8
+ACCURACY_TO_DISTANCE = {
+    "exact": 0,
+    "high": 3,
+    "medium": 6,
+    "low": 8,
+}
+# Duration filter -> duration_diff seconds
+#   Any = -1 (disabled), Equal = 0, then 1 / 5 / 10 seconds
+DURATION_TO_DIFF = {
+    "any": -1.0,
+    "equal": 0.0,
+    "1": 1.0,
+    "5": 5.0,
+    "10": 10.0,
+}
+
+DEFAULT_ACCURACY = "exact"
+DEFAULT_DURATION = "1"
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -23,8 +47,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("MRStashDupManager")
 
-# ── GraphQL ────────────────────────────────────────────────────────────────────
 
+# ── GraphQL ────────────────────────────────────────────────────────────────────
 def graphql_query(url, apikey, query, variables=None):
     headers = {"Content-Type": "application/json"}
     if apikey:
@@ -51,7 +75,7 @@ def get_configuration(url, apikey):
     """Read plugin settings out of Stash's saved configuration."""
     try:
         data = graphql_query(url, apikey, """
-        query { configuration { plugins } }
+            query { configuration { plugins } }
         """)
         plugins = (data.get("configuration") or {}).get("plugins") or {}
         return plugins.get("MRStashDupManager", {}) or {}
@@ -66,31 +90,32 @@ def find_duplicate_scenes(url, apikey, distance, duration_diff):
     is a list of scene objects that share (near-)identical perceptual hashes.
     """
     query = """
-    query FindDuplicateScenes($distance: Int, $duration_diff: Float) {
-      findDuplicateScenes(distance: $distance, duration_diff: $duration_diff) {
-        id
-        title
-        rating100
-        organized
-        date
-        studio { id name }
-        tags { id name }
-        performers { id name }
-        galleries { id }
-        files {
-          id
-          path
-          size
-          duration
-          width
-          height
-          video_codec
-          audio_codec
-          bit_rate
-          frame_rate
+        query FindDuplicateScenes($distance: Int, $duration_diff: Float) {
+            findDuplicateScenes(distance: $distance, duration_diff: $duration_diff) {
+                id
+                title
+                details
+                rating100
+                organized
+                date
+                studio { id name }
+                tags { id name }
+                performers { id name }
+                galleries { id }
+                files {
+                    id
+                    path
+                    size
+                    duration
+                    width
+                    height
+                    video_codec
+                    audio_codec
+                    bit_rate
+                    frame_rate
+                }
+            }
         }
-      }
-    }
     """
     variables = {"distance": distance, "duration_diff": duration_diff}
     data = graphql_query(url, apikey, query, variables)
@@ -104,9 +129,9 @@ def ensure_tag_exists(url, apikey, tag_name):
             return {"id": t["id"], "name": t["name"]}
     log.info("Creating tag '%s'...", tag_name)
     created = graphql_query(url, apikey, """
-    mutation TagCreate($input: TagCreateInput!) {
-      tagCreate(input: $input) { id name }
-    }
+        mutation TagCreate($input: TagCreateInput!) {
+            tagCreate(input: $input) { id name }
+        }
     """, {"input": {"name": tag_name}})
     tag = created.get("tagCreate")
     if not tag:
@@ -114,8 +139,76 @@ def ensure_tag_exists(url, apikey, tag_name):
     return tag
 
 
-# ── Preference / scoring ───────────────────────────────────────────────────────
+# ── Setting / preset resolution ────────────────────────────────────────────────
+def _clean_label(v):
+    return str(v or "").strip().lower()
 
+
+def resolve_distance(accuracy_label, cfg):
+    """
+    Resolve the phash distance from (in priority order):
+      1. an explicit accuracy label passed to the scan (Exact/High/Medium/Low)
+      2. a numeric matchDistance in plugin settings (back-compat)
+      3. the accuracy label saved in plugin settings
+      4. the default (exact / 0)
+    Returns (distance:int, accuracy_label:str).
+    """
+    lbl = _clean_label(accuracy_label)
+    if lbl in ACCURACY_TO_DISTANCE:
+        return ACCURACY_TO_DISTANCE[lbl], lbl
+
+    # Back-compat: a raw numeric matchDistance in settings still wins if present.
+    raw = cfg.get("matchDistance")
+    if raw not in (None, ""):
+        try:
+            d = int(raw)
+            # Map the number back to the closest label for display purposes.
+            nearest = min(ACCURACY_TO_DISTANCE.items(), key=lambda kv: abs(kv[1] - d))[0]
+            return d, nearest
+        except (TypeError, ValueError):
+            pass
+
+    lbl_cfg = _clean_label(cfg.get("accuracy"))
+    if lbl_cfg in ACCURACY_TO_DISTANCE:
+        return ACCURACY_TO_DISTANCE[lbl_cfg], lbl_cfg
+
+    return ACCURACY_TO_DISTANCE[DEFAULT_ACCURACY], DEFAULT_ACCURACY
+
+
+def resolve_duration_diff(duration_label, cfg):
+    """
+    Resolve duration_diff seconds from (in priority order):
+      1. an explicit duration label passed to the scan (Any/Equal/1/5/10)
+      2. a numeric durationDiff in plugin settings (back-compat)
+      3. the duration label saved in plugin settings
+      4. the default (1 second)
+    Returns (duration_diff:float, duration_label:str).
+    """
+    lbl = _clean_label(duration_label)
+    if lbl in DURATION_TO_DIFF:
+        return DURATION_TO_DIFF[lbl], lbl
+
+    raw = cfg.get("durationDiff")
+    if raw not in (None, ""):
+        try:
+            d = float(raw)
+            # Map the number back to the closest label for display.
+            if d < 0:
+                return -1.0, "any"
+            nearest = min(DURATION_TO_DIFF.items(),
+                          key=lambda kv: abs(kv[1] - d) if kv[1] >= 0 else 1e9)[0]
+            return d, nearest
+        except (TypeError, ValueError):
+            pass
+
+    lbl_cfg = _clean_label(cfg.get("duration"))
+    if lbl_cfg in DURATION_TO_DIFF:
+        return DURATION_TO_DIFF[lbl_cfg], lbl_cfg
+
+    return DURATION_TO_DIFF[DEFAULT_DURATION], DEFAULT_DURATION
+
+
+# ── Preference / scoring ───────────────────────────────────────────────────────
 def _norm_path(p):
     return (p or "").replace("\\", "/").lower()
 
@@ -169,6 +262,7 @@ def scene_metrics(scene):
 def choose_keeper(scenes, whitelist, graylist, blacklist):
     """
     Decide which scene in a duplicate group should be kept.
+
     Preference order:
       1. path rank (whitelist beats graylist beats blacklist)
       2. higher resolution
@@ -176,6 +270,7 @@ def choose_keeper(scenes, whitelist, graylist, blacklist):
       4. higher bitrate
       5. larger file size
       6. longer path (usually better organised / deeper folder)
+
     Returns the index of the keeper within `scenes`.
     """
     best_idx = 0
@@ -217,33 +312,23 @@ def reason_for_deletion(keeper_m, cand_m, cand_rank, keeper_rank):
 
 
 # ── Scan task ─────────────────────────────────────────────────────────────────
-
-def task_scan(url, apikey):
+def task_scan(url, apikey, accuracy_label=None, duration_label=None):
     os.makedirs(ASSETS_DIR, exist_ok=True)
     _write_status({"status": "running", "message": "Loading configuration...", "progress": 0})
 
     cfg = get_configuration(url, apikey)
 
-    def _num(name, default):
-        v = cfg.get(name)
-        if v is None or v == "":
-            return default
-        try:
-            return type(default)(v)
-        except (TypeError, ValueError):
-            return default
+    distance, accuracy_used = resolve_distance(accuracy_label, cfg)
+    duration_diff, duration_used = resolve_duration_diff(duration_label, cfg)
 
-    distance = int(_num("matchDistance", 0))          # 0 = exact phash match
-    duration_diff = float(_num("durationDiff", 1.0))  # seconds; negative disables
     whitelist = _path_list(cfg.get("whitelist"))
     graylist = _path_list(cfg.get("graylist"))
     blacklist = _path_list(cfg.get("blacklist"))
 
-    log.info("distance=%s duration_diff=%s whitelist=%s graylist=%s blacklist=%s",
-             distance, duration_diff, whitelist, graylist, blacklist)
+    log.info("accuracy=%s(distance=%s) duration=%s(diff=%s) whitelist=%s graylist=%s blacklist=%s",
+             accuracy_used, distance, duration_used, duration_diff, whitelist, graylist, blacklist)
 
     _write_status({"status": "running", "message": "Querying Stash for duplicates...", "progress": 10})
-
     try:
         groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
     except Exception as e:
@@ -285,6 +370,7 @@ def task_scan(url, apikey):
                 "scene_id": s["id"],
                 "file_id": f.get("id"),
                 "title": s.get("title") or os.path.basename(m["path"]),
+                "details": s.get("details") or "",
                 "path": m["path"],
                 "size": m["size"],
                 "duration": m["duration"],
@@ -303,6 +389,7 @@ def task_scan(url, apikey):
                 "path_rank": rank,
                 "is_keeper": is_keeper,
                 "excluded": excluded,
+                "delete_risk": _delete_would_overflow(m["path"]),
             }
             if not is_keeper:
                 member["reasons"] = reason_for_deletion(keeper_m, m, rank, keeper_rank)
@@ -323,6 +410,8 @@ def task_scan(url, apikey):
         "settings": {
             "distance": distance,
             "duration_diff": duration_diff,
+            "accuracy": accuracy_used,
+            "duration": duration_used,
             "whitelist": whitelist,
             "graylist": graylist,
             "blacklist": blacklist,
@@ -336,9 +425,23 @@ def task_scan(url, apikey):
              len(report_groups), total_reclaimable / (1024 ** 3))
 
 
-# ── Tag task (optional convenience) ────────────────────────────────────────────
+# ── Filename-length safety helper ──────────────────────────────────────────────
+DELETE_SUFFIX = ".delete"
+MAX_NAME_BYTES = 255  # ext4/xfs/apfs; lower for SMB/eCryptfs shares
 
-def task_tag_duplicates(url, apikey):
+
+def _delete_would_overflow(path, suffix=DELETE_SUFFIX, limit=MAX_NAME_BYTES):
+    """
+    True if Stash's soft-delete rename (append '.delete' to the basename) would
+    exceed the filesystem's per-component byte limit. The UI uses this to warn
+    and to trigger a rename-first fallback before deletion.
+    """
+    base = os.path.basename((path or "").replace("\\", "/"))
+    return len(base.encode("utf-8")) + len(suffix.encode("utf-8")) > limit
+
+
+# ── Tag task (optional convenience) ────────────────────────────────────────────
+def task_tag_duplicates(url, apikey, accuracy_label=None, duration_label=None):
     """
     Re-run the scan logic and apply the _DuplicateMarkForDeletion tag to every
     non-keeper scene. Useful for users who prefer to review via Stash's normal
@@ -348,14 +451,14 @@ def task_tag_duplicates(url, apikey):
     _write_status({"status": "running", "message": "Tagging duplicates...", "progress": 0})
 
     cfg = get_configuration(url, apikey)
-    distance = int(cfg.get("matchDistance") or 0)
-    try:
-        duration_diff = float(cfg.get("durationDiff") or 1.0)
-    except (TypeError, ValueError):
-        duration_diff = 1.0
+    distance, accuracy_used = resolve_distance(accuracy_label, cfg)
+    duration_diff, duration_used = resolve_duration_diff(duration_label, cfg)
     whitelist = _path_list(cfg.get("whitelist"))
     graylist = _path_list(cfg.get("graylist"))
     blacklist = _path_list(cfg.get("blacklist"))
+
+    log.info("tag: accuracy=%s(distance=%s) duration=%s(diff=%s)",
+             accuracy_used, distance, duration_used, duration_diff)
 
     dup_tag = ensure_tag_exists(url, apikey, DUPLICATE_TAG_NAME)
     groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
@@ -373,9 +476,9 @@ def task_tag_duplicates(url, apikey):
             if dup_tag["id"] in existing:
                 continue
             graphql_query(url, apikey, """
-            mutation SceneUpdate($input: SceneUpdateInput!) {
-              sceneUpdate(input: $input) { id }
-            }
+                mutation SceneUpdate($input: SceneUpdateInput!) {
+                    sceneUpdate(input: $input) { id }
+                }
             """, {"input": {"id": s["id"], "tag_ids": existing + [dup_tag["id"]]}})
             tagged += 1
 
@@ -386,7 +489,6 @@ def task_tag_duplicates(url, apikey):
 
 
 # ── Asset writers ─────────────────────────────────────────────────────────────
-
 def _write_status(data):
     os.makedirs(ASSETS_DIR, exist_ok=True)
     with open(os.path.join(ASSETS_DIR, "dup_status.json"), "w") as f:
@@ -399,15 +501,33 @@ def _write_report(data):
         json.dump(data, f)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+def _extract_args(input_data):
+    """
+    Pull mode/accuracy/duration out of the plugin invocation. Stash passes
+    plugin-task args under 'args'; the UI (runPluginTask) sends them as a flat
+    dict. Falls back to the task name for menu-triggered runs.
+    """
+    raw_args = input_data.get("args", {})
+    if not isinstance(raw_args, dict):
+        raw_args = {}
 
+    mode = raw_args.get("mode", "")
+    accuracy = raw_args.get("accuracy")
+    duration = raw_args.get("duration")
+
+    task_name = mode or input_data.get("task", {}).get("name", "")
+    return task_name, accuracy, duration
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     raw_stdin = sys.stdin.read()
     if not raw_stdin.strip():
         print("ERROR: stdin is empty.", flush=True)
         sys.exit(1)
-
     input_data = json.loads(raw_stdin)
+
     server_connection = input_data.get("server_connection", {})
     scheme = server_connection.get("Scheme", "http")
     port = server_connection.get("Port", 9999)
@@ -430,18 +550,16 @@ def main():
 
     url = f"{scheme}://localhost:{port}/graphql"
 
-    raw_args = input_data.get("args", {})
-    task_name = raw_args.get("mode", "") if isinstance(raw_args, dict) else ""
-    if not task_name:
-        task_name = input_data.get("task", {}).get("name", "")
+    task_name, accuracy, duration = _extract_args(input_data)
 
-    print(f"Task={task_name!r} PluginDir={PLUGIN_DIR!r}", flush=True)
+    print(f"Task={task_name!r} accuracy={accuracy!r} duration={duration!r} PluginDir={PLUGIN_DIR!r}",
+          flush=True)
 
     try:
         if task_name == "Scan for Duplicates":
-            task_scan(url, apikey)
+            task_scan(url, apikey, accuracy, duration)
         elif task_name == "Tag Duplicates":
-            task_tag_duplicates(url, apikey)
+            task_tag_duplicates(url, apikey, accuracy, duration)
         else:
             print(f"Unknown task: {task_name!r}", flush=True)
             sys.exit(1)

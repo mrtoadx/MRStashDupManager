@@ -456,3 +456,56 @@
 #dm-nav-btn:hover {
   background: rgba(255, 255, 255, 0.08) !important;
 }
+
+.dm-criteria {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 14px;
+  margin-left: 4px;
+}
+
+.dm-criteria-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.dm-criteria-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #90a4ae;
+}
+
+.dm-select {
+  background: #1c2127;
+  color: #e0e0e0;
+  border: 1px solid #384049;
+  border-radius: 5px;
+  padding: 5px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  min-width: 96px;
+}
+
+.dm-select:hover:not(:disabled) {
+  border-color: #4fc3f7;
+}
+
+.dm-select:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.dm-longname-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: #ffb74d;
+  background: rgba(255, 183, 77, 0.12);
+  border: 1px solid rgba(255, 183, 77, 0.4);
+  border-radius: 4px;
+}

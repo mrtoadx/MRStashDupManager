@@ -1,54 +1,65 @@
 name: MRStashDupManager
-description: Detects duplicate scenes via Stash's perceptual-hash matching and presents a modern side-by-side review UI to keep the best copy and delete or remove the rest.
-version: 1.0.0
-exec:
-  - python3
-  - "{pluginDir}/MRStashDupManager.py"
-interface: raw
-tasks:
-  - name: Scan for Duplicates
-    description: Finds duplicate scenes by phash and writes a review report for the UI. Run 'Generate Phashes' first if you haven't.
-    defaultArgs:
-      mode: Scan for Duplicates
-  - name: Tag Duplicates
-    description: Applies the _DuplicateMarkForDeletion tag to the lower-quality copy in each duplicate group, for review in Stash's normal library UI.
-    defaultArgs:
-      mode: Tag Duplicates
+description: >-
+  Detect duplicate scenes using Stash's built-in perceptual-hash (phash)
+  matching and review them side-by-side to keep the best copy and delete or
+  remove the rest.
+version: 1.1.0
+url: https://github.com/mrtoadx/MRStashDupManager
+
 ui:
   javascript:
     - MRStashDupManager.js
   css:
     - MRStashDupManager.css
-  assets:
-    /: assets/
+
+exec:
+  - python
+  - "{pluginDir}/MRStashDupManager.py"
+interface: raw
+
 settings:
-  matchDistance:
-    displayName: Match Distance
-    description: >
-      Perceptual-hash hamming distance. 0 = exact match (safest). Higher values
-      (1-10) catch more near-duplicates but risk false positives. Default 0.
-    type: NUMBER
-  durationDiff:
-    displayName: Max Duration Difference (seconds)
-    description: >
-      Only treat scenes as duplicates when their durations are within this many
-      seconds of each other. Set to -1 to disable duration checking. Default 1.
-    type: NUMBER
+  accuracy:
+    displayName: Default Search Accuracy
+    description: >-
+      phash match strictness used when a scan is started from the Tasks menu.
+      Exact (distance 0), High (3), Medium (6), or Low (8). Higher = looser
+      matching / more candidates. The in-app UI lets you pick this per scan.
+    type: STRING
+  duration:
+    displayName: Default Duration Filter
+    description: >-
+      Only match scenes whose durations are within this window when scanning
+      from the Tasks menu. One of: Any, Equal, 1, 5, 10 (seconds). "Any"
+      disables the duration filter entirely. The in-app UI lets you pick this
+      per scan.
+    type: STRING
   whitelist:
-    displayName: Whitelist Paths (never delete)
-    description: >
-      Comma-separated paths that should always be kept. Scenes in these paths are
-      preferred as the copy to keep. E.g. /media/Favorites,/mnt/keep
+    displayName: Whitelist Paths
+    description: >-
+      Comma/semicolon separated path fragments that should always be KEPT
+      (never marked for deletion).
     type: STRING
   graylist:
-    displayName: Gray-list Paths (secondary)
-    description: >
-      Comma-separated preferential paths used to break ties when choosing which
-      copy to keep. Ranked below whitelist, above blacklist.
+    displayName: Gray-list Paths
+    description: >-
+      Comma/semicolon separated path fragments treated as secondary copies.
     type: STRING
   blacklist:
-    displayName: Blacklist Paths (delete first)
-    description: >
-      Comma-separated least-preferred paths. Scenes in these paths are the first
-      candidates for deletion. E.g. /media/Downloads,/mnt/temp
+    displayName: Blacklist Paths
+    description: >-
+      Comma/semicolon separated path fragments preferred for deletion first.
     type: STRING
+
+tasks:
+  - name: Scan for Duplicates
+    description: >-
+      Build the duplicate report the review UI reads (uses the default accuracy
+      and duration settings above).
+    defaultArgs:
+      mode: Scan for Duplicates
+  - name: Tag Duplicates
+    description: >-
+      Apply the _DuplicateMarkForDeletion tag to the lower-quality copy in each
+      duplicate group, for review via Stash's normal library filters.
+    defaultArgs:
+      mode: Tag Duplicates

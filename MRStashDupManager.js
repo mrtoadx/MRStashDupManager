@@ -15,6 +15,58 @@
   const PLUGIN_ID = "MRStashDupManager";
   const EXCLUDE_TAG_NAME = "_DuplicateExclude";
 
+  // ── Matching presets (mirror Stash's native Scene Duplicate Checker) ──────────
+  // Search accuracy dropdown -> phash distance is resolved server-side; here we
+  // only need the labels to send as args and to display.
+  const ACCURACY_OPTIONS = [
+    { value: "exact", label: "Exact" },
+    { value: "high", label: "High" },
+    { value: "medium", label: "Medium" },
+    { value: "low", label: "Low" },
+  ];
+  const DURATION_OPTIONS = [
+    { value: "any", label: "Any" },
+    { value: "equal", label: "Equal" },
+    { value: "1", label: "1 sec" },
+    { value: "5", label: "5 sec" },
+    { value: "10", label: "10 sec" },
+  ];
+  const DEFAULT_ACCURACY = "exact";
+  const DEFAULT_DURATION = "1";
+
+  // ── Filename-length safeguards ────────────────────────────────────────────────
+  // Stash's soft-delete step renames "<name>" -> "<name>.delete" before removing
+  // it. If the basename is already near the FS per-component byte limit, that
+  // rename fails with ENAMETOOLONG. We detect it and rename the file shorter first.
+  const DELETE_SUFFIX = ".delete";
+  const MAX_NAME_BYTES = 255; // ext4/xfs/apfs; lower for SMB/CIFS/eCryptfs shares
+
+  function byteLength(s) {
+    return new TextEncoder().encode(s).length;
+  }
+
+  function deleteWouldOverflow(path) {
+    return byteLength(basename(path)) + byteLength(DELETE_SUFFIX) > MAX_NAME_BYTES;
+  }
+
+  function shortenBasename(name, budget) {
+    budget = budget || MAX_NAME_BYTES - byteLength(DELETE_SUFFIX);
+    const dot = name.lastIndexOf(".");
+    const ext = dot > 0 ? name.slice(dot) : "";
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    const room = budget - byteLength(ext) - 5; // headroom for a uniquifier
+    let bytes = enc.encode(stem);
+    if (bytes.length <= room) return name;
+
+    bytes = bytes.slice(0, room);
+    const trimmedStem = dec.decode(bytes).replace(/\uFFFD+$/, ""); // drop partial char
+    const tag = Math.random().toString(36).slice(2, 6);
+    return `${trimmedStem}_${tag}${ext}`;
+  }
+
   // ── GraphQL ──────────────────────────────────────────────────────────────────
   async function gqlQuery(query, variables) {
     const res = await fetch("/graphql", {
@@ -48,6 +100,16 @@
           delete_generated: true,
         },
       }
+    );
+  }
+
+  async function renameFileBasename(fileId, newBasename) {
+    // Rename in place (same folder), just changing the basename.
+    return gqlQuery(
+      `mutation MoveFiles($input: MoveFilesInput!) {
+        moveFiles(input: $input)
+      }`,
+      { input: { ids: [fileId], destination_basename: newBasename } }
     );
   }
 
@@ -100,6 +162,17 @@
       }`,
       { input }
     );
+  }
+
+  // Delete a scene's file, shortening the basename first if Stash's ".delete"
+  // rename would overflow the filesystem name limit.
+  async function deleteSceneFileSafely(member) {
+    if (member.file_id && deleteWouldOverflow(member.path)) {
+      const shortName = shortenBasename(basename(member.path));
+      LOG("Filename too long for soft-delete; renaming first:", basename(member.path), "→", shortName);
+      await renameFileBasename(member.file_id, shortName);
+    }
+    await destroyScene(member.scene_id, true);
   }
 
   // ── Asset polling ─────────────────────────────────────────────────────────────
@@ -183,7 +256,7 @@
   const IconStar = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 13, height: 13, fill: "currentColor", stroke: "none" }, ce("polygon", { points: "12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" }));
   const IconMerge = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 13, height: 13, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }, ce("path", { d: "M8 3v3a2 2 0 0 1-2 2H3" }), ce("path", { d: "M8 21v-3a2 2 0 0 0-2-2H3" }), ce("path", { d: "M21 12H8" }), ce("polyline", { points: "16 7 21 12 16 17" }));
   const IconLink = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 12, height: 12, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }, ce("path", { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" }), ce("path", { d: "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" }));
-  const IconSpinner = () => ce("div", { className: "dm-spinner" });
+  const IconWarn = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 12, height: 12, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }, ce("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }), ce("line", { x1: 12, y1: 9, x2: 12, y2: 13 }), ce("line", { x1: 12, y1: 17, x2: 12.01, y2: 17 }));
 
   // ── Scene card ─────────────────────────────────────────────────────────────────
 
@@ -202,6 +275,9 @@
     const maxRes = Math.max(...group.members.map((m) => m.resolution));
     const maxDur = Math.max(...group.members.map((m) => Math.round(m.duration)));
     const maxSize = Math.max(...group.members.map((m) => m.size));
+
+    // Prefer the server-computed flag, but fall back to a client check.
+    const longName = member.delete_risk != null ? member.delete_risk : deleteWouldOverflow(member.path);
 
     return ce("div", { className: `dm-card ${isKeeper ? "dm-card-keep" : "dm-card-delete"}` },
       ce("div", { className: "dm-card-header" },
@@ -244,6 +320,11 @@
         ),
         member.performers.length > 3 && ce("span", { className: "dm-meta-chip" }, `+${member.performers.length - 3}`)
       ),
+
+      !isKeeper && longName &&
+        ce("div", { className: "dm-longname-warn", title: "Filename is near the OS length limit; the plugin will rename it shorter before deletion." },
+          ce(IconWarn), " long filename — will shorten before delete"
+        ),
 
       !isKeeper && member.reasons && member.reasons.length > 0 &&
         ce("div", { className: "dm-reasons" },
@@ -317,6 +398,8 @@
     const [actionMsg, setActionMsg] = useState("");
     const [busy, setBusy] = useState(false);
     const [search, setSearch] = useState("");
+    const [accuracy, setAccuracy] = useState(DEFAULT_ACCURACY);
+    const [duration, setDuration] = useState(DEFAULT_DURATION);
     const [keeperOverrides, setKeeperOverrides] = useState({}); // group_id -> scene_id
     const cancelRef = useRef(null);
 
@@ -327,6 +410,9 @@
           if (data && data.status === "done" && (data.groups || []).length > 0) {
             setReport(data);
             setPhase("review");
+            // Reflect the criteria the existing report was built with, if present.
+            if (data.settings && data.settings.accuracy) setAccuracy(data.settings.accuracy);
+            if (data.settings && data.settings.duration) setDuration(data.settings.duration);
           }
         })
         .catch(() => {});
@@ -346,7 +432,11 @@
       setKeeperOverrides({});
 
       try {
-        await runPluginTask("Scan for Duplicates", []);
+        await runPluginTask("Scan for Duplicates", [
+          { key: "mode", value: { str: "Scan for Duplicates" } },
+          { key: "accuracy", value: { str: accuracy } },
+          { key: "duration", value: { str: duration } },
+        ]);
       } catch (e) {
         setPhase("error");
         setErrorMsg("Failed to start scan: " + e.message);
@@ -399,11 +489,14 @@
         } else if (kind === "remove") {
           await destroyScene(member.scene_id, false);
         } else if (kind === "delete") {
-          await destroyScene(member.scene_id, true);
+          await deleteSceneFileSafely(member);
         } else if (kind === "merge_delete") {
           const keeper = group.members.find((m) => m.is_keeper);
+          // Delete the file FIRST (the step that can fail on name length), then
+          // merge metadata — so a failure never leaves the keeper half-merged
+          // against a file that's still present.
+          await deleteSceneFileSafely(member);
           if (keeper) await mergeMetadata(keeper, member);
-          await destroyScene(member.scene_id, true);
         }
 
         // Remove this member from the group in local state
@@ -429,7 +522,14 @@
         setActionMsg(`${verb}: ${basename(member.path)}`);
       } catch (e) {
         WARN("Action failed", kind, e);
-        setErrorMsg(`${kind} failed: ${e.message}`);
+        let msg = e.message || String(e);
+        if (/file name too long|too long/i.test(msg)) {
+          msg = "Filename too long for Stash's delete step. The plugin tried to " +
+            "rename it shorter first — if this persists, the folder path itself may " +
+            "be over the limit, or the share (SMB/NFS/encrypted) has a stricter cap " +
+            "than 255 bytes.";
+        }
+        setErrorMsg(`${kind} failed: ${msg}`);
       } finally {
         setBusy(false);
       }
@@ -440,7 +540,7 @@
       if (!search) return true;
       const q = search.toLowerCase();
       return g.members.some(
-        (m) => (m.title + " " + m.path).toLowerCase().includes(q)
+        (m) => (m.title + " " + (m.details || "") + " " + m.path).toLowerCase().includes(q)
       );
     });
 
@@ -471,6 +571,30 @@
             disabled: phase === "scanning" || busy,
           }, ce(IconScan), " ", phase === "scanning" ? "Scanning…" : "Scan for Duplicates"),
 
+          // Matching criteria controls
+          ce("div", { className: "dm-criteria" },
+            ce("label", { className: "dm-criteria-field" },
+              ce("span", { className: "dm-criteria-label" }, "Search accuracy"),
+              ce("select", {
+                className: "dm-select",
+                value: accuracy,
+                disabled: phase === "scanning" || busy,
+                onChange: (e) => setAccuracy(e.target.value),
+                title: "phash similarity: Exact=0, High=3, Medium=6, Low=8 (higher = looser matching)",
+              }, ACCURACY_OPTIONS.map((o) => ce("option", { key: o.value, value: o.value }, o.label)))
+            ),
+            ce("label", { className: "dm-criteria-field" },
+              ce("span", { className: "dm-criteria-label" }, "Duration"),
+              ce("select", {
+                className: "dm-select",
+                value: duration,
+                disabled: phase === "scanning" || busy,
+                onChange: (e) => setDuration(e.target.value),
+                title: "Only match scenes whose durations are within this window. 'Any' disables the duration filter.",
+              }, DURATION_OPTIONS.map((o) => ce("option", { key: o.value, value: o.value }, o.label)))
+            )
+          ),
+
           scanStatus && phase === "scanning" && ce("div", { className: "dm-scan-progress" },
             ce("div", { className: "dm-progress-track" },
               ce("div", { className: "dm-progress-fill", style: { width: (scanStatus.progress || 2) + "%" } })
@@ -495,7 +619,7 @@
             ce("input", {
               className: "dm-search",
               type: "text",
-              placeholder: "Search title or path…",
+              placeholder: "Search title, details or path…",
               value: search,
               onChange: (e) => setSearch(e.target.value),
             })
@@ -517,9 +641,10 @@
         ),
 
         phase === "idle" && ce("div", { className: "dm-empty-state" },
-          "Click ", ce("strong", null, "Scan for Duplicates"), " to begin. ",
+          "Choose your matching criteria above, then click ", ce("strong", null, "Scan for Duplicates"), ". ",
           ce("span", { className: "dm-hint" },
-            "Tip: run Stash's ‘Generate Phashes’ task first if you haven't already."
+            "Tip: run Stash's ‘Generate Phashes’ task first if you haven't already. " +
+            "Widen ‘Search accuracy’ or set Duration to ‘Any’ if a known duplicate isn't showing up."
           )
         ),
 
