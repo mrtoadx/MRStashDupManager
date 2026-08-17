@@ -10,14 +10,19 @@ url: https://github.com/mrtoadx/MRStashDupManager
 # generated dup_status.json / dup_report.json at
 #   /plugin/MRStashDupManager/assets/<file>
 # Without this block the files are written to disk but return 404.
-assets:
-  urlPrefix: assets
-
+# Serve the plugin's assets/ folder over HTTP so the UI can poll the
+# generated dup_status.json / dup_report.json. The assets map lives under
+# `ui` and maps a URL prefix to an on-disk folder (relative to this file).
+# The "/" prefix -> "assets" produces:
+#   /plugin/MRStashDupManager/assets/<file>  ->  {pluginDir}/assets/<file>
+# Without this the JSON is written to disk but returns 404.
 ui:
   javascript:
     - MRStashDupManager.js
   css:
     - MRStashDupManager.css
+  assets:
+    /: assets
 
 exec:
   - python
