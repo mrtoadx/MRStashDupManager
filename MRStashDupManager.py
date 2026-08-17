@@ -543,10 +543,21 @@ def main():
 
     plugin_dir_from_stash = server_connection.get("PluginDir", "")
     if plugin_dir_from_stash:
+        # Prefer the script's own directory — it's physically inside the plugin
+        # folder that Stash serves at /plugin/<id>/assets/. PluginDir from the
+        # server connection can point elsewhere on some setups, which breaks the
+        # asset polling with a permanent 404.
         global PLUGIN_DIR, ASSETS_DIR
-        PLUGIN_DIR = plugin_dir_from_stash
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if os.path.isdir(script_dir):
+            PLUGIN_DIR = script_dir
+        else:
+            plugin_dir_from_stash = server_connection.get("PluginDir", "")
+            if plugin_dir_from_stash:
+                PLUGIN_DIR = plugin_dir_from_stash
         ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
         os.makedirs(ASSETS_DIR, exist_ok=True)
+        print(f"Writing assets to: {ASSETS_DIR}", flush=True)
 
     url = f"{scheme}://localhost:{port}/graphql"
 
