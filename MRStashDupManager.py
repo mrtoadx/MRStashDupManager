@@ -270,9 +270,9 @@ def choose_keeper(scenes, whitelist, graylist, blacklist):
     Preference order:
       1. path rank (whitelist beats graylist beats blacklist)
       2. higher resolution
-      3. longer duration
-      4. higher bitrate
-      5. larger file size
+      3. higher bitrate
+      4. larger file size
+      5. longer duration
       6. longer path (usually better organised / deeper folder)
 
     Returns the index of the keeper within `scenes`.
@@ -283,12 +283,15 @@ def choose_keeper(scenes, whitelist, graylist, blacklist):
         m = scene_metrics(s)
         rank = path_rank(m["path"], whitelist, graylist, blacklist)
         # Negate the things where "bigger is better" so a plain min() picks the keeper.
+        # Bitrate and size come before duration: a longer copy is often just an
+        # added intro/outro bumper on a re-encode, not a better source, so we don't
+        # want extra runtime to outweigh a cleaner, higher-bitrate file.
         key = (
             rank,
             -m["resolution"],
-            -round(m["duration"]),
             -m["bit_rate"],
             -m["size"],
+            -round(m["duration"]),
             -len(m["path"]),
         )
         if best_key is None or key < best_key:
@@ -304,12 +307,12 @@ def reason_for_deletion(keeper_m, cand_m, cand_rank, keeper_rank):
         reasons.append(f"lower-priority path ({label})")
     if cand_m["resolution"] < keeper_m["resolution"]:
         reasons.append("lower resolution")
-    if round(cand_m["duration"]) < round(keeper_m["duration"]):
-        reasons.append("shorter duration")
     if cand_m["bit_rate"] < keeper_m["bit_rate"]:
         reasons.append("lower bitrate")
     if cand_m["size"] < keeper_m["size"]:
         reasons.append("smaller file")
+    if round(cand_m["duration"]) < round(keeper_m["duration"]):
+        reasons.append("shorter duration")
     if not reasons:
         reasons.append("duplicate of kept scene")
     return reasons
