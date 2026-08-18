@@ -273,6 +273,34 @@
   const IconLink = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 12, height: 12, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }, ce("path", { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" }), ce("path", { d: "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" }));
   const IconWarn = () => ce("svg", { xmlns: "http://www.w3.org/2000/svg", viewBox: "0 0 24 24", width: 12, height: 12, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }, ce("path", { d: "M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" }), ce("line", { x1: 12, y1: 9, x2: 12, y2: 13 }), ce("line", { x1: 12, y1: 17, x2: 12.01, y2: 17 }));
 
+  // ── Sprite grid ────────────────────────────────────────────────────────────────
+  // Stash generates a "_sprite.jpg" per scene: a single image holding a grid of
+  // thumbnails sampled across the scene's duration (the same asset the scrubber
+  // preview uses). We render it as-is — it's already a grid, so it gives the
+  // at-a-glance "is this the same video" comparison the native duplicate checker
+  // shows. If the sprite hasn't been generated yet the <img> 404s, so we hide it
+  // on error rather than showing a broken-image icon.
+
+  function SpriteGrid({ member }) {
+    const [failed, setFailed] = useState(false);
+
+    // Prefer the sprite (grid of frames); fall back to the single screenshot.
+    const src = member.sprite || member.screenshot;
+    if (!src || failed) return null;
+
+    const isSprite = !!member.sprite;
+    return ce("div", { className: "dm-sprite-wrap" },
+      ce("img", {
+        className: "dm-sprite" + (isSprite ? "" : " dm-sprite-single"),
+        src,
+        loading: "lazy",
+        alt: isSprite ? "frame grid" : "cover frame",
+        title: isSprite ? "Sampled frames across the scene" : "Cover frame",
+        onError: () => setFailed(true),
+      })
+    );
+  }
+
   // ── Scene card ─────────────────────────────────────────────────────────────────
 
   function StatBadge({ label, value, highlight }) {
@@ -317,6 +345,8 @@
       ),
 
       ce("code", { className: "dm-card-path", title: member.path }, member.path),
+
+      ce(SpriteGrid, { member }),
 
       ce("div", { className: "dm-card-stats" },
         ce(StatBadge, { label: "Resolution", value: resolutionLabel(member), highlight: member.resolution === maxRes && maxRes > 0 }),
@@ -659,6 +689,7 @@
           "Choose your matching criteria above, then click ", ce("strong", null, "Scan for Duplicates"), ". ",
           ce("span", { className: "dm-hint" },
             "Tip: run Stash's ‘Generate Phashes’ task first if you haven't already. " +
+            "Generate ‘Sprites’ too if you want the frame-grid previews to show. " +
             "Widen ‘Search accuracy’ or set Duration to ‘Any’ if a known duplicate isn't showing up."
           )
         ),

@@ -102,6 +102,10 @@ def find_duplicate_scenes(url, apikey, distance, duration_diff):
                 tags { id name }
                 performers { id name }
                 galleries { id }
+                paths {
+                    sprite
+                    screenshot
+                }
                 files {
                     id
                     path
@@ -361,6 +365,7 @@ def task_scan(url, apikey, accuracy_label=None, duration_label=None):
         for i, s in enumerate(scenes):
             m = scene_metrics(s)
             f = primary_file(s)
+            paths = s.get("paths") or {}
             is_keeper = (i == keeper_idx)
             rank = path_rank(m["path"], whitelist, graylist, blacklist)
             excluded = any(t["name"].lower() == EXCLUDE_TAG_NAME.lower()
@@ -372,6 +377,8 @@ def task_scan(url, apikey, accuracy_label=None, duration_label=None):
                 "title": s.get("title") or os.path.basename(m["path"]),
                 "details": s.get("details") or "",
                 "path": m["path"],
+                "sprite": paths.get("sprite"),
+                "screenshot": paths.get("screenshot"),
                 "size": m["size"],
                 "duration": m["duration"],
                 "width": f.get("width") or 0,

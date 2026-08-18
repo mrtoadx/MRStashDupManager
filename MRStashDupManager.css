@@ -344,6 +344,30 @@
   line-height: 1.4;
 }
 
+/* Sprite / frame grid */
+.dm-sprite-wrap {
+  border-radius: 6px;
+  overflow: hidden;
+  background: #0f151d;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  line-height: 0;
+}
+.dm-sprite {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: auto;
+}
+/* When only a single cover frame is available, cap its height so it doesn't
+   dominate the card the way a full sprite sheet's aspect ratio does. */
+.dm-sprite-single {
+  max-height: 180px;
+  width: auto;
+  max-width: 100%;
+  margin: 0 auto;
+  object-fit: contain;
+}
+
 /* Stats */
 .dm-card-stats {
   display: flex;
