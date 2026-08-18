@@ -23,6 +23,7 @@
     { value: "high", label: "High" },
     { value: "medium", label: "Medium" },
     { value: "low", label: "Low" },
+    { value: "loose", label: "Loose" },
   ];
   const DURATION_OPTIONS = [
     { value: "any", label: "Any" },
@@ -385,9 +386,37 @@
     const losers = group.members.filter((m) => !m.is_keeper);
     const reclaimable = losers.reduce((s, m) => s + m.size, 0);
 
+    // How was this group flagged? phash / stash_id / both. A stash-id-only group
+    // has no perceptual-hash confirmation, so we badge it distinctly to prompt a
+    // visual check against the frame grid before deleting.
+    const mt = group.match_types || ["phash"];
+    const hasPhash = mt.includes("phash");
+    const hasStashId = mt.includes("stash_id");
+    let matchLabel, matchClass;
+    if (hasPhash && hasStashId) {
+      matchLabel = "phash + stash-id";
+      matchClass = "dm-match-both";
+    } else if (hasStashId) {
+      matchLabel = "stash-id only";
+      matchClass = "dm-match-stashid";
+    } else {
+      matchLabel = "phash";
+      matchClass = "dm-match-phash";
+    }
+
     return ce("div", { className: "dm-group" },
       ce("div", { className: "dm-group-header" },
-        ce("span", { className: "dm-group-title" }, `Duplicate group · ${group.members.length} copies`),
+        ce("div", { className: "dm-group-header-left" },
+          ce("span", { className: "dm-group-title" }, `Duplicate group · ${group.members.length} copies`),
+          ce("span", {
+            className: `dm-match-badge ${matchClass}`,
+            title: hasStashId && !hasPhash
+              ? "Matched only by shared stash-box id — phashes differ. Confirm visually with the frame grid before deleting."
+              : hasPhash && hasStashId
+              ? "Matched by both perceptual hash and shared stash-box id."
+              : "Matched by perceptual hash.",
+          }, matchLabel)
+        ),
         ce("span", { className: "dm-group-reclaim" }, `${fmtBytes(reclaimable)} reclaimable`)
       ),
 
@@ -625,7 +654,7 @@
                 value: accuracy,
                 disabled: phase === "scanning" || busy,
                 onChange: (e) => setAccuracy(e.target.value),
-                title: "phash similarity: Exact=0, High=3, Medium=6, Low=8 (higher = looser matching)",
+                title: "phash similarity: Exact=0, High=3, Medium=6, Low=8, Loose=12 (higher = looser matching, more false positives)",
               }, ACCURACY_OPTIONS.map((o) => ce("option", { key: o.value, value: o.value }, o.label)))
             ),
             ce("label", { className: "dm-criteria-field" },
@@ -690,7 +719,8 @@
           ce("span", { className: "dm-hint" },
             "Tip: run Stash's ‘Generate Phashes’ task first if you haven't already. " +
             "Generate ‘Sprites’ too if you want the frame-grid previews to show. " +
-            "Widen ‘Search accuracy’ or set Duration to ‘Any’ if a known duplicate isn't showing up."
+            "Widen ‘Search accuracy’ (try ‘Loose’) or set Duration to ‘Any’ if a known duplicate isn't showing up. " +
+            "Scenes matched to the same StashDB scene are also grouped automatically, even when their phashes differ."
           )
         ),
 

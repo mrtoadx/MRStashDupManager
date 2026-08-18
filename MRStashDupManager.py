@@ -18,11 +18,16 @@ EXCLUDE_TAG_NAME = "_DuplicateExclude"
 # ---------------------------------------------------------------------------
 # Search accuracy -> phash hamming distance
 #   Exact = 0, High = 3, Medium = 6, Low = 8
+#   Loose = 12 is ABOVE Stash's native "Low" ceiling of 8. It catches pairs whose
+#   frame sampling has drifted (e.g. an added intro/outro shifts the phash), at
+#   the cost of more false positives — always eyeball the sprite grid before
+#   deleting a Loose-only match.
 ACCURACY_TO_DISTANCE = {
     "exact": 0,
     "high": 3,
     "medium": 6,
     "low": 8,
+    "loose": 12,
 }
 # Duration filter -> duration_diff seconds
 #   Any = -1 (disabled), Equal = 0, then 1 / 5 / 10 seconds
@@ -124,6 +129,160 @@ def find_duplicate_scenes(url, apikey, distance, duration_diff):
     variables = {"distance": distance, "duration_diff": duration_diff}
     data = graphql_query(url, apikey, query, variables)
     return data.get("findDuplicateScenes", []) or []
+
+
+# Fields fetched for every scene, whichever pass found it. Kept identical to the
+# phash query's selection so build_member() can treat both sources the same.
+_SCENE_FIELDS = """
+    id
+    title
+    details
+    rating100
+    organized
+    date
+    studio { id name }
+    tags { id name }
+    performers { id name }
+    galleries { id }
+    stash_ids { endpoint stash_id }
+    paths {
+        sprite
+        screenshot
+    }
+    files {
+        id
+        path
+        size
+        duration
+        width
+        height
+        video_codec
+        audio_codec
+        bit_rate
+        frame_rate
+    }
+"""
+
+
+def find_stash_id_duplicate_groups(url, apikey):
+    """
+    Find duplicates by shared stash-box id. Two files matched to the same
+    catalogued scene on the same stash-box endpoint are the same content by
+    definition — independent of phash — so this catches pairs whose perceptual
+    hashes have drifted too far to group (e.g. an added intro/outro).
+
+    Returns a list of groups (each a list of scene objects), same shape as
+    find_duplicate_scenes, so the two passes can be merged uniformly.
+    """
+    # Page through all scenes that carry at least one stash_id. The
+    # stash_id_endpoint filter with NOT_NULL returns only identified scenes,
+    # which keeps this far cheaper than walking the whole library.
+    query = """
+        query FindStashIdScenes($filter: FindFilterType, $scene_filter: SceneFilterType) {
+            findScenes(filter: $filter, scene_filter: $scene_filter) {
+                count
+                scenes { %s }
+            }
+        }
+    """ % _SCENE_FIELDS
+
+    scene_filter = {"stash_id_endpoint": {"modifier": "NOT_NULL"}}
+    per_page = 200
+    page = 1
+    all_scenes = []
+    while True:
+        variables = {
+            "filter": {"per_page": per_page, "page": page, "sort": "id", "direction": "ASC"},
+            "scene_filter": scene_filter,
+        }
+        data = graphql_query(url, apikey, query, variables)
+        result = data.get("findScenes") or {}
+        scenes = result.get("scenes") or []
+        all_scenes.extend(scenes)
+        total = result.get("count") or 0
+        if page * per_page >= total or not scenes:
+            break
+        page += 1
+
+    # Bucket by (endpoint, stash_id). A scene can carry ids from multiple
+    # endpoints, so it may land in more than one bucket; the later merge step
+    # collapses any groups that end up sharing scenes.
+    buckets = {}
+    for s in all_scenes:
+        for sid in (s.get("stash_ids") or []):
+            endpoint = (sid.get("endpoint") or "").strip()
+            value = (sid.get("stash_id") or "").strip()
+            if not value:
+                continue
+            buckets.setdefault((endpoint, value), []).append(s)
+
+    # Only keep buckets with 2+ distinct scenes.
+    groups = []
+    for (endpoint, value), scenes in buckets.items():
+        seen = {}
+        for s in scenes:
+            seen[s["id"]] = s  # dedupe by scene id within a bucket
+        if len(seen) >= 2:
+            groups.append(list(seen.values()))
+    return groups
+
+
+def _merge_scene_groups(*group_lists):
+    """
+    Union any groups (from either pass) that share one or more scene ids, so a
+    pair caught by both phash AND stash-id becomes a single review group rather
+    than two near-identical ones.
+
+    Returns a list of (scenes, match_types) tuples, where match_types is a set
+    like {"phash"}, {"stash_id"}, or {"phash", "stash_id"} describing why the
+    group was flagged.
+    """
+    # Each raw group is tagged with its source as we ingest it.
+    tagged = []  # list of [set_of_scene_ids, {id: scene}, set_of_match_types]
+    sources = ("phash", "stash_id")
+    for src, glist in zip(sources, group_lists):
+        for scenes in glist:
+            ids = {s["id"] for s in scenes}
+            by_id = {s["id"]: s for s in scenes}
+            tagged.append([ids, by_id, {src}])
+
+    # Iteratively coalesce groups that overlap on any scene id.
+    merged = []
+    for ids, by_id, mtypes in tagged:
+        hit = None
+        for existing in merged:
+            if existing[0] & ids:
+                hit = existing
+                break
+        if hit:
+            hit[0] |= ids
+            hit[1].update(by_id)
+            hit[2] |= mtypes
+        else:
+            merged.append([set(ids), dict(by_id), set(mtypes)])
+
+    # A second pass catches transitive overlaps (A∩B and B∩C but not A∩C on the
+    # first sweep). Repeat until stable.
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        for grp in merged:
+            hit = None
+            for existing in out:
+                if existing[0] & grp[0]:
+                    hit = existing
+                    break
+            if hit:
+                hit[0] |= grp[0]
+                hit[1].update(grp[1])
+                hit[2] |= grp[2]
+                changed = True
+            else:
+                out.append(grp)
+        merged = out
+
+    return [(list(by_id.values()), mtypes) for _ids, by_id, mtypes in merged]
 
 
 def ensure_tag_exists(url, apikey, tag_name):
@@ -318,6 +477,77 @@ def reason_for_deletion(keeper_m, cand_m, cand_rank, keeper_rank):
     return reasons
 
 
+# ── Group / member building ────────────────────────────────────────────────────
+def build_group(scenes, match_types, group_id, whitelist, graylist, blacklist):
+    """
+    Turn a raw list of duplicate scene objects into a report group dict.
+    `match_types` is a set describing why the group was flagged ('phash',
+    'stash_id', or both). Returns (group_dict, reclaimable_bytes) or (None, 0)
+    if the group is too small to be meaningful.
+    """
+    scenes = [s for s in scenes if (s.get("files") or [])]
+    if len(scenes) < 2:
+        return None, 0
+
+    keeper_idx = choose_keeper(scenes, whitelist, graylist, blacklist)
+    keeper_m = scene_metrics(scenes[keeper_idx])
+    keeper_rank = path_rank(keeper_m["path"], whitelist, graylist, blacklist)
+
+    match_list = sorted(match_types)
+    reclaimable = 0
+    members = []
+    for i, s in enumerate(scenes):
+        m = scene_metrics(s)
+        f = primary_file(s)
+        paths = s.get("paths") or {}
+        is_keeper = (i == keeper_idx)
+        rank = path_rank(m["path"], whitelist, graylist, blacklist)
+        excluded = any(t["name"].lower() == EXCLUDE_TAG_NAME.lower()
+                       for t in (s.get("tags") or []))
+
+        member = {
+            "scene_id": s["id"],
+            "file_id": f.get("id"),
+            "title": s.get("title") or os.path.basename(m["path"]),
+            "details": s.get("details") or "",
+            "path": m["path"],
+            "sprite": paths.get("sprite"),
+            "screenshot": paths.get("screenshot"),
+            "size": m["size"],
+            "duration": m["duration"],
+            "width": f.get("width") or 0,
+            "height": f.get("height") or 0,
+            "video_codec": f.get("video_codec") or "",
+            "bit_rate": m["bit_rate"],
+            "frame_rate": f.get("frame_rate") or 0,
+            "resolution": m["resolution"],
+            "rating100": s.get("rating100"),
+            "organized": s.get("organized", False),
+            "date": s.get("date"),
+            "studio": (s.get("studio") or {}).get("name") if s.get("studio") else None,
+            "tags": [{"id": t["id"], "name": t["name"]} for t in (s.get("tags") or [])],
+            "performers": [{"id": p["id"], "name": p["name"]} for p in (s.get("performers") or [])],
+            "stash_ids": [{"endpoint": x.get("endpoint"), "stash_id": x.get("stash_id")}
+                          for x in (s.get("stash_ids") or [])],
+            "path_rank": rank,
+            "is_keeper": is_keeper,
+            "excluded": excluded,
+            "delete_risk": _delete_would_overflow(m["path"]),
+        }
+        if not is_keeper:
+            member["reasons"] = reason_for_deletion(keeper_m, m, rank, keeper_rank)
+            reclaimable += m["size"]
+        members.append(member)
+
+    group = {
+        "group_id": group_id,
+        "keeper_scene_id": scenes[keeper_idx]["id"],
+        "match_types": match_list,
+        "members": members,
+    }
+    return group, reclaimable
+
+
 # ── Scan task ─────────────────────────────────────────────────────────────────
 def task_scan(url, apikey, accuracy_label=None, duration_label=None):
     os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -335,9 +565,9 @@ def task_scan(url, apikey, accuracy_label=None, duration_label=None):
     log.info("accuracy=%s(distance=%s) duration=%s(diff=%s) whitelist=%s graylist=%s blacklist=%s",
              accuracy_used, distance, duration_used, duration_diff, whitelist, graylist, blacklist)
 
-    _write_status({"status": "running", "message": "Querying Stash for duplicates...", "progress": 10})
+    _write_status({"status": "running", "message": "Querying Stash for phash duplicates...", "progress": 10})
     try:
-        groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
+        phash_groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
     except Exception as e:
         msg = str(e)
         if "phash" in msg.lower():
@@ -347,70 +577,36 @@ def task_scan(url, apikey, accuracy_label=None, duration_label=None):
         _write_report({"status": "error", "message": msg, "groups": []})
         return
 
+    # Second pass: group by shared stash-box id. This catches content-identical
+    # pairs whose phashes drifted apart (added intro/outro, re-encode) — the case
+    # phash distance can't reach even at the Loose ceiling. Non-fatal if it fails:
+    # we still return the phash results.
     _write_status({"status": "running",
-                   "message": f"Analyzing {len(groups)} duplicate groups...",
+                   "message": "Querying Stash for stash-id matches...", "progress": 35})
+    try:
+        stash_id_groups = find_stash_id_duplicate_groups(url, apikey)
+    except Exception as e:
+        log.warning("stash-id pass failed (continuing with phash only): %s", e)
+        stash_id_groups = []
+
+    # Merge the two passes so a pair caught by both is one group, tagged with why.
+    merged = _merge_scene_groups(phash_groups, stash_id_groups)
+
+    _write_status({"status": "running",
+                   "message": f"Analyzing {len(merged)} duplicate groups...",
                    "progress": 60})
 
     report_groups = []
     total_reclaimable = 0
 
-    for gi, scenes in enumerate(groups):
-        # Skip malformed groups
-        scenes = [s for s in scenes if (s.get("files") or [])]
-        if len(scenes) < 2:
+    for gi, (scenes, match_types) in enumerate(merged):
+        group, reclaimable = build_group(
+            scenes, match_types, gi, whitelist, graylist, blacklist
+        )
+        if group is None:
             continue
-
-        keeper_idx = choose_keeper(scenes, whitelist, graylist, blacklist)
-        keeper_m = scene_metrics(scenes[keeper_idx])
-        keeper_rank = path_rank(keeper_m["path"], whitelist, graylist, blacklist)
-
-        members = []
-        for i, s in enumerate(scenes):
-            m = scene_metrics(s)
-            f = primary_file(s)
-            paths = s.get("paths") or {}
-            is_keeper = (i == keeper_idx)
-            rank = path_rank(m["path"], whitelist, graylist, blacklist)
-            excluded = any(t["name"].lower() == EXCLUDE_TAG_NAME.lower()
-                           for t in (s.get("tags") or []))
-
-            member = {
-                "scene_id": s["id"],
-                "file_id": f.get("id"),
-                "title": s.get("title") or os.path.basename(m["path"]),
-                "details": s.get("details") or "",
-                "path": m["path"],
-                "sprite": paths.get("sprite"),
-                "screenshot": paths.get("screenshot"),
-                "size": m["size"],
-                "duration": m["duration"],
-                "width": f.get("width") or 0,
-                "height": f.get("height") or 0,
-                "video_codec": f.get("video_codec") or "",
-                "bit_rate": m["bit_rate"],
-                "frame_rate": f.get("frame_rate") or 0,
-                "resolution": m["resolution"],
-                "rating100": s.get("rating100"),
-                "organized": s.get("organized", False),
-                "date": s.get("date"),
-                "studio": (s.get("studio") or {}).get("name") if s.get("studio") else None,
-                "tags": [{"id": t["id"], "name": t["name"]} for t in (s.get("tags") or [])],
-                "performers": [{"id": p["id"], "name": p["name"]} for p in (s.get("performers") or [])],
-                "path_rank": rank,
-                "is_keeper": is_keeper,
-                "excluded": excluded,
-                "delete_risk": _delete_would_overflow(m["path"]),
-            }
-            if not is_keeper:
-                member["reasons"] = reason_for_deletion(keeper_m, m, rank, keeper_rank)
-                total_reclaimable += m["size"]
-            members.append(member)
-
-        report_groups.append({
-            "group_id": gi,
-            "keeper_scene_id": scenes[keeper_idx]["id"],
-            "members": members,
-        })
+        report_groups.append(group)
+        total_reclaimable += reclaimable
 
     report = {
         "status": "done",
@@ -431,8 +627,9 @@ def task_scan(url, apikey, accuracy_label=None, duration_label=None):
     _write_status({"status": "done",
                    "message": f"Found {len(report_groups)} duplicate groups.",
                    "progress": 100})
-    log.info("Scan complete: %s groups, %.2f GB reclaimable",
-             len(report_groups), total_reclaimable / (1024 ** 3))
+    log.info("Scan complete: %s groups (%s phash, %s stash-id raw), %.2f GB reclaimable",
+             len(report_groups), len(phash_groups), len(stash_id_groups),
+             total_reclaimable / (1024 ** 3))
 
 
 # ── Filename-length safety helper ──────────────────────────────────────────────
