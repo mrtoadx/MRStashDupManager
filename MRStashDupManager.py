@@ -4,51 +4,28 @@ import urllib.request
 import urllib.error
 import os
 import re
+import shutil
+import time
 import logging
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
 SESSION_COOKIE = None
 
-DUPLICATE_TAG_NAME = "_DuplicateMarkForDeletion"
-EXCLUDE_TAG_NAME = "_DuplicateExclude"
-
-# ---------------------------------------------------------------------------
-# Matching presets — mirror Stash's native Scene Duplicate Checker dropdowns
-# ---------------------------------------------------------------------------
-# Search accuracy -> phash hamming distance
-#   Exact = 0, High = 3, Medium = 6, Low = 8
-ACCURACY_TO_DISTANCE = {
-    "exact": 0,
-    "high": 3,
-    "medium": 6,
-    "low": 8,
-}
-# Duration filter -> duration_diff seconds
-#   Any = -1 (disabled), Equal = 0, then 1 / 5 / 10 seconds
-DURATION_TO_DIFF = {
-    "any": -1.0,
-    "equal": 0.0,
-    "1": 1.0,
-    "5": 5.0,
-    "10": 10.0,
-}
-
-DEFAULT_ACCURACY = "exact"
-DEFAULT_DURATION = "1"
+MISSING_STUDIO_TAG_NAME = "MissingStudio"
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="[MRStashDupManager] %(asctime)s %(levelname)s %(message)s",
+    format="[MRStashSanitize] %(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("MRStashDupManager")
-
+log = logging.getLogger("MRStashSanitize")
 
 # ── GraphQL ────────────────────────────────────────────────────────────────────
+
 def graphql_query(url, apikey, query, variables=None):
     headers = {"Content-Type": "application/json"}
     if apikey:
@@ -59,483 +36,739 @@ def graphql_query(url, apikey, query, variables=None):
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as e:
-        log.error("GraphQL request failed: %s", e)
-        raise
-    if payload.get("errors"):
-        # Surface the first error message but keep going where possible
-        msg = payload["errors"][0].get("message", "unknown GraphQL error")
-        log.error("GraphQL error: %s", msg)
-        raise RuntimeError(msg)
-    return payload.get("data", {})
+        print(f"GraphQL request failed: {e}", flush=True)
+        sys.exit(1)
 
 
-def get_configuration(url, apikey):
-    """Read plugin settings out of Stash's saved configuration."""
-    try:
-        data = graphql_query(url, apikey, """
-            query { configuration { plugins } }
-        """)
-        plugins = (data.get("configuration") or {}).get("plugins") or {}
-        return plugins.get("MRStashDupManager", {}) or {}
-    except Exception as e:
-        log.warning("Could not load plugin configuration: %s", e)
-        return {}
-
-
-def find_duplicate_scenes(url, apikey, distance, duration_diff):
-    """
-    Call Stash's built-in duplicate finder. Returns a list of groups; each group
-    is a list of scene objects that share (near-)identical perceptual hashes.
-    """
-    query = """
-        query FindDuplicateScenes($distance: Int, $duration_diff: Float) {
-            findDuplicateScenes(distance: $distance, duration_diff: $duration_diff) {
-                id
-                title
-                details
-                rating100
-                organized
-                date
-                studio { id name }
-                tags { id name }
-                performers { id name }
-                galleries { id }
-                files {
-                    id
-                    path
-                    size
-                    duration
-                    width
-                    height
-                    video_codec
-                    audio_codec
-                    bit_rate
-                    frame_rate
-                }
-            }
-        }
-    """
-    variables = {"distance": distance, "duration_diff": duration_diff}
-    data = graphql_query(url, apikey, query, variables)
-    return data.get("findDuplicateScenes", []) or []
+def get_all_tags(url, apikey):
+    """Return {tag_name_lower: {id, name}} for every tag in Stash."""
+    res = graphql_query(url, apikey, """
+    query { allTags { id name aliases } }
+    """)
+    tags = res.get("data", {}).get("allTags", [])
+    lookup = {}
+    for t in tags:
+        lookup[t["name"].lower()] = {"id": t["id"], "name": t["name"]}
+        for alias in (t.get("aliases") or []):
+            if alias.lower() not in lookup:
+                lookup[alias.lower()] = {"id": t["id"], "name": t["name"]}
+    return lookup
 
 
 def ensure_tag_exists(url, apikey, tag_name):
-    data = graphql_query(url, apikey, "query { allTags { id name } }")
-    for t in data.get("allTags", []):
+    """
+    Look up a tag by name and create it if missing.
+    Uses allTags (version-stable, no filter syntax issues).
+    Returns {"id": ..., "name": ...}.
+    """
+    res = graphql_query(url, apikey, "query { allTags { id name } }")
+    all_tags = res.get("data", {}).get("allTags", [])
+    for t in all_tags:
         if t["name"].lower() == tag_name.lower():
+            log.info("Tag '%s' already exists (id=%s)", tag_name, t["id"])
             return {"id": t["id"], "name": t["name"]}
+
     log.info("Creating tag '%s'...", tag_name)
-    created = graphql_query(url, apikey, """
-        mutation TagCreate($input: TagCreateInput!) {
-            tagCreate(input: $input) { id name }
-        }
-    """, {"input": {"name": tag_name}})
-    tag = created.get("tagCreate")
-    if not tag:
-        raise RuntimeError(f"Failed to create tag '{tag_name}'")
-    return tag
-
-
-# ── Setting / preset resolution ────────────────────────────────────────────────
-def _clean_label(v):
-    return str(v or "").strip().lower()
-
-
-def resolve_distance(accuracy_label, cfg):
-    """
-    Resolve the phash distance from (in priority order):
-      1. an explicit accuracy label passed to the scan (Exact/High/Medium/Low)
-      2. a numeric matchDistance in plugin settings (back-compat)
-      3. the accuracy label saved in plugin settings
-      4. the default (exact / 0)
-    Returns (distance:int, accuracy_label:str).
-    """
-    lbl = _clean_label(accuracy_label)
-    if lbl in ACCURACY_TO_DISTANCE:
-        return ACCURACY_TO_DISTANCE[lbl], lbl
-
-    # Back-compat: a raw numeric matchDistance in settings still wins if present.
-    raw = cfg.get("matchDistance")
-    if raw not in (None, ""):
-        try:
-            d = int(raw)
-            # Map the number back to the closest label for display purposes.
-            nearest = min(ACCURACY_TO_DISTANCE.items(), key=lambda kv: abs(kv[1] - d))[0]
-            return d, nearest
-        except (TypeError, ValueError):
-            pass
-
-    lbl_cfg = _clean_label(cfg.get("accuracy"))
-    if lbl_cfg in ACCURACY_TO_DISTANCE:
-        return ACCURACY_TO_DISTANCE[lbl_cfg], lbl_cfg
-
-    return ACCURACY_TO_DISTANCE[DEFAULT_ACCURACY], DEFAULT_ACCURACY
-
-
-def resolve_duration_diff(duration_label, cfg):
-    """
-    Resolve duration_diff seconds from (in priority order):
-      1. an explicit duration label passed to the scan (Any/Equal/1/5/10)
-      2. a numeric durationDiff in plugin settings (back-compat)
-      3. the duration label saved in plugin settings
-      4. the default (1 second)
-    Returns (duration_diff:float, duration_label:str).
-    """
-    lbl = _clean_label(duration_label)
-    if lbl in DURATION_TO_DIFF:
-        return DURATION_TO_DIFF[lbl], lbl
-
-    raw = cfg.get("durationDiff")
-    if raw not in (None, ""):
-        try:
-            d = float(raw)
-            # Map the number back to the closest label for display.
-            if d < 0:
-                return -1.0, "any"
-            nearest = min(DURATION_TO_DIFF.items(),
-                          key=lambda kv: abs(kv[1] - d) if kv[1] >= 0 else 1e9)[0]
-            return d, nearest
-        except (TypeError, ValueError):
-            pass
-
-    lbl_cfg = _clean_label(cfg.get("duration"))
-    if lbl_cfg in DURATION_TO_DIFF:
-        return DURATION_TO_DIFF[lbl_cfg], lbl_cfg
-
-    return DURATION_TO_DIFF[DEFAULT_DURATION], DEFAULT_DURATION
-
-
-# ── Preference / scoring ───────────────────────────────────────────────────────
-def _norm_path(p):
-    return (p or "").replace("\\", "/").lower()
-
-
-def _path_list(raw):
-    """Split a comma/semicolon/newline separated path list from settings."""
-    if not raw:
-        return []
-    parts = re.split(r"[,;\n]+", raw)
-    return [_norm_path(p.strip()) for p in parts if p.strip()]
-
-
-def path_rank(path, whitelist, graylist, blacklist):
-    """
-    Lower number = more preferred to KEEP.
-      0 = whitelist (never delete)
-      1 = neutral / unknown path
-      2 = graylist (secondary)
-      3 = blacklist (delete first)
-    """
-    np = _norm_path(path)
-    if any(np.startswith(w) or w in np for w in whitelist):
-        return 0
-    if any(np.startswith(b) or b in np for b in blacklist):
-        return 3
-    if any(np.startswith(g) or g in np for g in graylist):
-        return 2
-    return 1
-
-
-def primary_file(scene):
-    files = scene.get("files") or []
-    return files[0] if files else {}
-
-
-def scene_metrics(scene):
-    f = primary_file(scene)
-    width = f.get("width") or 0
-    height = f.get("height") or 0
-    return {
-        "resolution": width * height,
-        "height": height,
-        "duration": f.get("duration") or 0,
-        "size": f.get("size") or 0,
-        "bit_rate": f.get("bit_rate") or 0,
-        "path": f.get("path") or "",
-        "file_id": f.get("id"),
+    create_res = graphql_query(url, apikey, """
+    mutation TagCreate($input: TagCreateInput!) {
+      tagCreate(input: $input) { id name }
     }
+    """, {"input": {"name": tag_name}})
+    tag = create_res.get("data", {}).get("tagCreate")
+    if tag:
+        log.info("Created tag '%s' (id=%s)", tag["name"], tag["id"])
+        return tag
+    raise RuntimeError(f"Failed to create tag '{tag_name}'")
 
 
-def choose_keeper(scenes, whitelist, graylist, blacklist):
+def get_scenes_paginated(url, apikey, page=1, per_page=100):
+    res = graphql_query(url, apikey, """
+    query FindScenes($filter: FindFilterType) {
+      findScenes(filter: $filter) {
+        count
+        scenes {
+          id title date
+          tags { id name }
+          files { id path size }
+          studio { id name }
+        }
+      }
+    }
+    """, {"filter": {"page": page, "per_page": per_page, "sort": "id", "direction": "ASC"}})
+    d = res.get("data", {}).get("findScenes", {})
+    return d.get("count", 0), d.get("scenes", [])
+
+
+def update_scene(url, apikey, scene_id, new_title, tag_ids):
+    """Update scene title and tags via GraphQL."""
+    res = graphql_query(url, apikey, """
+    mutation SceneUpdate($input: SceneUpdateInput!) {
+      sceneUpdate(input: $input) { id }
+    }
+    """, {"input": {"id": scene_id, "title": new_title, "tag_ids": tag_ids}})
+    return res.get("data", {}).get("sceneUpdate")
+
+
+def move_file(url, apikey, file_id, new_path):
+    """Use Stash's moveFiles mutation to rename/move a file."""
+    dest_folder   = os.path.dirname(new_path)
+    dest_basename = os.path.basename(new_path)
+
+    log.warning("move_file asset dest_folder=%s dest_basename=%s new_path=%s", dest_folder, dest_basename, new_path)
+    res = graphql_query(url, apikey, """
+    mutation MoveFiles($input: MoveFilesInput!) {
+      moveFiles(input: $input)
+    }
+    """, {"input": {"ids": [file_id], "destination_folder": dest_folder, "destination_basename": dest_basename}})
+    return res.get("data", {}).get("moveFiles", False)
+
+
+# ── Studio folder naming ───────────────────────────────────────────────────────
+
+def studio_to_folder_name(studio_name):
     """
-    Decide which scene in a duplicate group should be kept.
-
-    Preference order:
-      1. path rank (whitelist beats graylist beats blacklist)
-      2. higher resolution
-      3. longer duration
-      4. higher bitrate
-      5. larger file size
-      6. longer path (usually better organised / deeper folder)
-
-    Returns the index of the keeper within `scenes`.
+    Convert a studio name to a CamelCase directory name with no spaces.
+    "Some Studio Name" → "SomeStudioName"
     """
-    best_idx = 0
-    best_key = None
-    for i, s in enumerate(scenes):
-        m = scene_metrics(s)
-        rank = path_rank(m["path"], whitelist, graylist, blacklist)
-        # Negate the things where "bigger is better" so a plain min() picks the keeper.
-        key = (
-            rank,
-            -m["resolution"],
-            -round(m["duration"]),
-            -m["bit_rate"],
-            -m["size"],
-            -len(m["path"]),
-        )
-        if best_key is None or key < best_key:
-            best_key = key
-            best_idx = i
-    return best_idx
+    if not studio_name:
+        return ""
+    parts = re.split(r'[\s_\-]+', studio_name)
+    return "".join(p[:1].upper() + p[1:] for p in parts if p)
 
 
-def reason_for_deletion(keeper_m, cand_m, cand_rank, keeper_rank):
-    reasons = []
-    if cand_rank > keeper_rank:
-        label = {1: "neutral", 2: "gray-list", 3: "black-list"}.get(cand_rank, "")
-        reasons.append(f"lower-priority path ({label})")
-    if cand_m["resolution"] < keeper_m["resolution"]:
-        reasons.append("lower resolution")
-    if round(cand_m["duration"]) < round(keeper_m["duration"]):
-        reasons.append("shorter duration")
-    if cand_m["bit_rate"] < keeper_m["bit_rate"]:
-        reasons.append("lower bitrate")
-    if cand_m["size"] < keeper_m["size"]:
-        reasons.append("smaller file")
-    if not reasons:
-        reasons.append("duplicate of kept scene")
-    return reasons
+# ── Poor-directory detection ───────────────────────────────────────────────────
+
+def _normalise_for_compare(s):
+    """Lowercase, strip non-alphanumeric, collapse spaces — used for fuzzy dir/stem matching."""
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
+def is_self_titled_dir(dir_name, file_stem):
+    """
+    Return True when the parent directory looks like it was named after this
+    specific file (a one-file "self-titled" folder).
+
+    Heuristics
+    ----------
+    • Normalised dir == normalised stem  (exact after stripping punctuation/case)
+    • Normalised dir is a prefix of normalised stem ≥ 80 % of stem length
+      (handles truncated folder names like "SomeLongTitle" / "SomeLongTitle_Part1")
+    • Normalised stem starts with normalised dir and the remainder is ≤ 12 chars
+      (e.g. dir="SceneName", stem="SceneName_4K_1080p")
+    """
+    nd = _normalise_for_compare(dir_name)
+    ns = _normalise_for_compare(file_stem)
+    if not nd or not ns:
+        return False
+    if nd == ns:
+        return True
+    # dir is a long prefix of stem
+    if ns.startswith(nd) and len(nd) >= max(6, int(len(ns) * 0.75)):
+        return True
+    # stem starts with dir and only a short suffix remains
+    if ns.startswith(nd) and (len(ns) - len(nd)) <= 12:
+        return True
+    return False
+
+
+def classify_directory(path, studio_folder):
+    """
+    Classify why a scene's directory is "poor".
+
+    Returns one of:
+      "ok"          – already in the correct studio folder
+      "wrong_studio"– parent dir doesn't match expected studio folder
+      "self_titled" – parent dir appears named after this specific file
+      "shallow"     – file sits only 1 level below a filesystem root
+                      (e.g. /videos/scene.mp4 — depth < 2 usable components)
+
+    `studio_folder` may be None if the scene has no studio assigned.
+    """
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    # parts[-1] is the filename; parts[-2] is the immediate parent dir
+    if len(parts) < 2:
+        return "shallow"
+
+    parent_dir  = parts[-2]
+    file_stem   = os.path.splitext(parts[-1])[0]
+
+    # Shallow: file is only one directory deep from root
+    if len(parts) == 2:
+        return "shallow"
+
+    if studio_folder:
+        if parent_dir == studio_folder:
+            return "ok"
+        # Self-titled takes priority over wrong_studio so the UI message is accurate
+        if is_self_titled_dir(parent_dir, file_stem):
+            return "self_titled"
+        return "wrong_studio"
+    else:
+        # No studio — still flag self-titled / shallow dirs
+        if is_self_titled_dir(parent_dir, file_stem):
+            return "self_titled"
+        return "ok"   # no studio, not self-titled → nothing we can do without more info
+
+
+# ── Tag affix / phrase helpers ─────────────────────────────────────────────────
+
+def strip_tag_affixes(s):
+    """
+    Remove leading/trailing sigils and separators from a parsed tag string.
+
+    A parsed tag must never carry a leading or trailing underscore, dash, or
+    hash. Interior separators are preserved (they get normalised to spaces by
+    token_to_phrase), only the edges are trimmed.
+    """
+    return re.sub(r'^[_\-#\s]+|[_\-#\s]+$', '', s or '')
+
+
+def token_to_phrase(raw_token):
+    """
+    Convert a raw filename token (e.g. '_BigAss', '#Blonde', 'Outdoor_Scene')
+    into a normalised, lower-case tag phrase ('big ass', 'blonde',
+    'outdoor scene'). Leading/trailing sigils are always stripped first, so the
+    resulting phrase never begins or ends with _ - or #.
+    """
+    s = strip_tag_affixes(raw_token)
+    if not s:
+        return ''
+    if s[0].isdigit():
+        return s.lower()
+    # Split on separators, then split CamelCase runs within each part.
+    parts = re.split(r'[_\-\s]+', s)
+    words = []
+    for part in parts:
+        found = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+', part)
+        words.extend(found or ([part] if part else []))
+    return ' '.join(w.lower() for w in words if w)
+
+
+# ── Sigil token extraction ─────────────────────────────────────────────────────
+#
+# We only treat *sigil-prefixed* tokens ( _Word / #Word ) as tag candidates.
+# Plain CamelCase words and ordinary underscore-separated title words are NOT
+# harvested as tags — that was the old behaviour that shredded legitimate
+# titles like "Some_Studio_-_A_Long_Title_With_Many_Words".
+
+SIGIL_WORD_RE = re.compile(
+    r'(?<![A-Za-z0-9])'          # not mid-word
+    r'([_#])'                    # a single sigil
+    r'([A-Za-z][A-Za-z0-9]*)'    # the word itself
+    r'(?![A-Za-z0-9])'
+)
+
+
+def extract_candidate_tokens(filename_no_ext):
+    """
+    Extract sigil-prefixed tag candidates ( _Word / #Word ).
+
+    Returns (sigil_tokens, other_tokens). other_tokens is retained for API
+    compatibility but is now always empty — we no longer guess tags from plain
+    CamelCase, which is what produced the over-aggressive stripping.
+    """
+    sigil_tokens = []
+    other_tokens = []
+    seen_raw     = set()
+
+    for m in SIGIL_WORD_RE.finditer(filename_no_ext):
+        raw = m.group(0)               # includes the leading sigil, e.g. '_Blonde'
+        if raw in seen_raw:
+            continue
+        seen_raw.add(raw)
+        phrase = token_to_phrase(raw)
+        # Ignore trivial single-character words (e.g. the "_A" in
+        # "..._-_A_Long_Title...") — these are almost always title words, not
+        # tags, and treating them as candidates is what caused over-stripping.
+        if phrase and len(phrase) >= 2:
+            sigil_tokens.append({"raw": raw, "phrase": phrase})
+
+    return sigil_tokens, other_tokens
+
+
+# ── Bracketed [TagA, TagB] extraction ──────────────────────────────────────────
+
+BRACKET_GROUP_RE = re.compile(r'\[([^\[\]]*)\]')
+
+
+def extract_bracket_tags(filename_no_ext):
+    """
+    Parse '[TagA, TagB]' style groups out of a filename.
+
+    Returns (tags, cleaned_stem) where:
+      • tags         is a list of {"raw": <original>, "phrase": <normalised>}
+                     with all leading/trailing _ - # stripped from each phrase.
+      • cleaned_stem is the filename with the bracket groups removed.
+
+    Tags inside a group may be separated by comma, semicolon, or pipe.
+    """
+    tags = []
+    seen = set()
+
+    for m in BRACKET_GROUP_RE.finditer(filename_no_ext):
+        inner = m.group(1)
+        for part in re.split(r'[,;|]', inner):
+            phrase = token_to_phrase(part)
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                tags.append({"raw": strip_tag_affixes(part.strip()), "phrase": phrase})
+
+    cleaned = BRACKET_GROUP_RE.sub(' ', filename_no_ext)
+    return tags, cleaned
+
+
+# ── Special-character sanitisation ─────────────────────────────────────────────
+
+# Characters that are illegal or undesirable in filenames. We keep letters,
+# digits, spaces, and a small set of safe punctuation: - _ ( ) . & ' ,
+_ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_UNWANTED_CHARS_RE = re.compile(r'[^\w\s\-\(\)\.\&\',]', re.UNICODE)
+
+
+def sanitize_special_chars(name):
+    """
+    Remove characters that are illegal or messy in filenames, then tidy up
+    whitespace and separators. Does not touch the extension (pass a stem).
+    """
+    if not name:
+        return ''
+    s = _ILLEGAL_CHARS_RE.sub(' ', name)
+    s = _UNWANTED_CHARS_RE.sub(' ', s)
+    # collapse repeated separators
+    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r'_{2,}', '_', s)
+    s = re.sub(r'-{2,}', '-', s)
+    # trim stray separators around spaces (e.g. " - - ")
+    s = re.sub(r'\s*-\s*-\s*', ' - ', s)
+    s = re.sub(r'^[\s_\-]+|[\s_\-]+$', '', s)
+    return s.strip()
+
+
+# ── Metadata-based rename ──────────────────────────────────────────────────────
+
+def year_from_scene(scene):
+    """Return a 4-digit year string from a scene's date, or '' if unavailable."""
+    date = scene.get("date") or ""
+    m = re.match(r'(\d{4})', str(date))
+    return m.group(1) if m else ''
+
+
+def build_metadata_stem(studio_name, title, year):
+    """
+    Build a canonical '<Studio> - <Title> (<Year>)' stem from metadata.
+
+    Any component may be missing:
+      • studio + title + year → "Studio - Title (2023)"
+      • title + year          → "Title (2023)"
+      • studio + title        → "Studio - Title"
+      • title only            → "Title"
+    Special characters are stripped from studio and title. Returns '' if there
+    is no usable title.
+    """
+    title = sanitize_special_chars(title or '')
+    if not title:
+        return ''
+    studio = sanitize_special_chars(studio_name or '')
+
+    if studio:
+        stem = f"{studio} - {title}"
+    else:
+        stem = title
+    if year:
+        stem = f"{stem} ({year})"
+    return sanitize_special_chars(stem)
+
+
+# ── Filename cleanup after token removal ───────────────────────────────────────
+
+def build_new_filename(original_stem, tokens_to_remove):
+    """
+    Remove the given raw tokens from a stem and tidy the result: collapse
+    repeated separators, drop dangling dashes/underscores left where tokens
+    used to be, and strip leading/trailing separators.
+    """
+    result = original_stem
+    sorted_tokens = sorted(tokens_to_remove, key=lambda t: len(t["raw"]), reverse=True)
+    for tok in sorted_tokens:
+        result = result.replace(tok["raw"], ' ')
+
+    # Where a token was removed we left a space, which can strand the
+    # surrounding separators, e.g. "dump_ _1080p" or "Foo _ - _ x264".
+    # Collapse any run of whitespace + _/- + whitespace down to a single space.
+    result = re.sub(r'[ \t]*[_\-][ \t]*(?=[ \t]*[_\-])', ' ', result)  # runs of seps
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r'_{2,}', '_', result)
+    result = re.sub(r'-{2,}', '-', result)
+    # A single separator floating between spaces (or at an edge) is dangling.
+    result = re.sub(r'(?:^|\s)[_\-](?:\s|$)', ' ', result)
+    # A separator with a space on exactly one side is a leftover edge from a
+    # removed token: "dump _1080p" → "dump 1080p", "A_ B" → "A B".
+    result = re.sub(r'\s[_\-]+(?=\w)', ' ', result)
+    result = re.sub(r'(?<=\w)[_\-]+\s', ' ', result)
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r'^[_\-\s]+|[_\-\s]+$', '', result)
+    return result.strip()
 
 
 # ── Scan task ─────────────────────────────────────────────────────────────────
-def task_scan(url, apikey, accuracy_label=None, duration_label=None):
+
+def task_scan(url, apikey):
+    """
+    Scan all scenes for:
+      1. Filenames containing tag-like tokens (original behaviour).
+      2. Scenes in poor directories (self-titled, shallow, or wrong-studio folders).
+      3. Scenes with no studio assigned → add MissingStudio tag.
+
+    Writes results to assets/sanitize_report.json.
+    """
     os.makedirs(ASSETS_DIR, exist_ok=True)
-    _write_status({"status": "running", "message": "Loading configuration...", "progress": 0})
+    _write_status({"status": "running", "message": "Loading config...", "progress": 0})
 
-    cfg = get_configuration(url, apikey)
+    # Config
+    config_res = graphql_query(url, apikey, "query { configuration { plugins } }")
+    plugins_cfg = config_res.get("data", {}).get("configuration", {}).get("plugins", {})
+    my_cfg = plugins_cfg.get("MRStashSanitize", {})
+    strip_unmatched = str(my_cfg.get("strip_unmatched_sigils", "true")).lower() not in ("false", "0", "no", "off")
+    print(f"strip_unmatched_sigils={strip_unmatched}", flush=True)
 
-    distance, accuracy_used = resolve_distance(accuracy_label, cfg)
-    duration_diff, duration_used = resolve_duration_diff(duration_label, cfg)
+    # Load all tags once; reused for token matching and MissingStudio check
+    _write_status({"status": "running", "message": "Loading tags...", "progress": 2})
+    print("Loading all tags...", flush=True)
+    tag_lookup = get_all_tags(url, apikey)
+    print(f"Loaded {len(tag_lookup)} tags/aliases", flush=True)
 
-    whitelist = _path_list(cfg.get("whitelist"))
-    graylist = _path_list(cfg.get("graylist"))
-    blacklist = _path_list(cfg.get("blacklist"))
+    # Ensure MissingStudio tag exists (uses already-loaded tag_lookup, only
+    # hits the network if the tag needs to be created)
+    _write_status({"status": "running", "message": "Ensuring system tags exist...", "progress": 4})
+    missing_studio_tag = ensure_tag_exists(url, apikey, MISSING_STUDIO_TAG_NAME)
+    missing_studio_tag_id = missing_studio_tag["id"]
+    tag_lookup[MISSING_STUDIO_TAG_NAME.lower()] = missing_studio_tag
+    log.info("MissingStudio tag id=%s", missing_studio_tag_id)
 
-    log.info("accuracy=%s(distance=%s) duration=%s(diff=%s) whitelist=%s graylist=%s blacklist=%s",
-             accuracy_used, distance, duration_used, duration_diff, whitelist, graylist, blacklist)
+    _write_status({"status": "running", "message": "Scanning scenes…", "progress": 5})
 
-    _write_status({"status": "running", "message": "Querying Stash for duplicates...", "progress": 10})
-    try:
-        groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
-    except Exception as e:
-        msg = str(e)
-        if "phash" in msg.lower():
-            msg = ("Stash returned a phash error. Run the "
-                   "'Generate Phashes' scan task first, then try again. (" + msg + ")")
-        _write_status({"status": "error", "message": msg})
-        _write_report({"status": "error", "message": msg, "groups": []})
-        return
+    # ── Scenes ────────────────────────────────────────────────────────────────
+    page = 1
+    per_page = 100
+    total_count, first_batch = get_scenes_paginated(url, apikey, page, per_page)
+    all_scenes = list(first_batch)
+    while len(all_scenes) < total_count:
+        page += 1
+        _, batch = get_scenes_paginated(url, apikey, page, per_page)
+        if not batch:
+            break
+        all_scenes.extend(batch)
 
-    _write_status({"status": "running",
-                   "message": f"Analyzing {len(groups)} duplicate groups...",
-                   "progress": 60})
+    print(f"Total scenes: {total_count}, fetched: {len(all_scenes)}", flush=True)
 
-    report_groups = []
-    total_reclaimable = 0
+    pending = []
 
-    for gi, scenes in enumerate(groups):
-        # Skip malformed groups
-        scenes = [s for s in scenes if (s.get("files") or [])]
-        if len(scenes) < 2:
+    for idx, scene in enumerate(all_scenes):
+        if idx % 50 == 0:
+            pct = 5 + int(idx / max(len(all_scenes), 1) * 90)
+            _write_status({"status": "running",
+                           "message": f"Scanning {idx+1}/{len(all_scenes)}…",
+                           "progress": pct})
+
+        files = scene.get("files", [])
+        if not files:
+            continue
+        file = files[0]
+        path = file.get("path", "")
+        if not path:
             continue
 
-        keeper_idx = choose_keeper(scenes, whitelist, graylist, blacklist)
-        keeper_m = scene_metrics(scenes[keeper_idx])
-        keeper_rank = path_rank(keeper_m["path"], whitelist, graylist, blacklist)
+        file_dirname    = os.path.dirname(path)
+        basename_orig   = os.path.basename(path)
+        stem, ext       = os.path.splitext(basename_orig)
 
-        members = []
-        for i, s in enumerate(scenes):
-            m = scene_metrics(s)
-            f = primary_file(s)
-            is_keeper = (i == keeper_idx)
-            rank = path_rank(m["path"], whitelist, graylist, blacklist)
-            excluded = any(t["name"].lower() == EXCLUDE_TAG_NAME.lower()
-                           for t in (s.get("tags") or []))
+        studio          = scene.get("studio")
+        studio_name     = studio["name"] if studio else None
+        studio_folder   = studio_to_folder_name(studio_name) if studio_name else None
 
-            member = {
-                "scene_id": s["id"],
-                "file_id": f.get("id"),
-                "title": s.get("title") or os.path.basename(m["path"]),
-                "details": s.get("details") or "",
-                "path": m["path"],
-                "size": m["size"],
-                "duration": m["duration"],
-                "width": f.get("width") or 0,
-                "height": f.get("height") or 0,
-                "video_codec": f.get("video_codec") or "",
-                "bit_rate": m["bit_rate"],
-                "frame_rate": f.get("frame_rate") or 0,
-                "resolution": m["resolution"],
-                "rating100": s.get("rating100"),
-                "organized": s.get("organized", False),
-                "date": s.get("date"),
-                "studio": (s.get("studio") or {}).get("name") if s.get("studio") else None,
-                "tags": [{"id": t["id"], "name": t["name"]} for t in (s.get("tags") or [])],
-                "performers": [{"id": p["id"], "name": p["name"]} for p in (s.get("performers") or [])],
-                "path_rank": rank,
-                "is_keeper": is_keeper,
-                "excluded": excluded,
-                "delete_risk": _delete_would_overflow(m["path"]),
-            }
-            if not is_keeper:
-                member["reasons"] = reason_for_deletion(keeper_m, m, rank, keeper_rank)
-                total_reclaimable += m["size"]
-            members.append(member)
+        existing_tag_ids = {t["id"] for t in scene.get("tags", [])}
 
-        report_groups.append({
-            "group_id": gi,
-            "keeper_scene_id": scenes[keeper_idx]["id"],
-            "members": members,
+        # ── Bracket [TagA, TagB] extraction ───────────────────────────────────
+        # These always become tags and are always removed from the filename.
+        bracket_tags, stem_after_brackets = extract_bracket_tags(stem)
+
+        # ── Sigil token analysis ( _Word / #Word ) ────────────────────────────
+        sigil_tokens, _other = extract_candidate_tokens(stem_after_brackets)
+
+        matched          = []      # sigil tokens that map to an existing tag
+        unmatched_sigil  = []      # sigil tokens with no matching tag
+
+        for c in sigil_tokens:
+            phrase = c["phrase"]
+            if phrase in tag_lookup:
+                matched.append({
+                    "raw": c["raw"],
+                    "phrase": phrase,
+                    "tag_id": tag_lookup[phrase]["id"],
+                    "tag_name": tag_lookup[phrase]["name"],
+                })
+            else:
+                unmatched_sigil.append({"raw": c["raw"], "phrase": phrase})
+
+        # Bracket tags: resolve each phrase against existing tags. Unmatched
+        # bracket tags are surfaced as "junk" so the user can promote them into
+        # real tags from the UI (same as unmatched sigils).
+        bracket_matched   = []
+        bracket_unmatched = []
+        for bt in bracket_tags:
+            phrase = bt["phrase"]
+            if phrase in tag_lookup:
+                bracket_matched.append({
+                    "raw": bt["raw"],
+                    "phrase": phrase,
+                    "tag_id": tag_lookup[phrase]["id"],
+                    "tag_name": tag_lookup[phrase]["name"],
+                })
+            else:
+                bracket_unmatched.append({"raw": bt["raw"], "phrase": phrase})
+
+        matched.extend(bracket_matched)
+        unmatched_sigil.extend(bracket_unmatched)
+
+        # ── Filename construction ─────────────────────────────────────────────
+        # Prefer a clean metadata-based name when we have a title. Otherwise,
+        # fall back to token-stripping the original stem.
+        title_meta = scene.get("title")
+        year_meta  = year_from_scene(scene)
+        metadata_stem = build_metadata_stem(studio_name, title_meta, year_meta)
+
+        # Tokens removed from the fallback stem (matched tags + optionally
+        # unmatched sigils). Bracket groups are already gone from
+        # stem_after_brackets.
+        tokens_to_strip = list(matched)
+        if strip_unmatched:
+            tokens_to_strip.extend(unmatched_sigil)
+
+        if metadata_stem:
+            new_stem      = metadata_stem
+            rename_source = "metadata"
+        else:
+            stripped = build_new_filename(stem_after_brackets, tokens_to_strip) \
+                       if (tokens_to_strip or bracket_tags) else stem_after_brackets
+            new_stem      = sanitize_special_chars(stripped) or stem
+            rename_source = "tokens"
+
+        new_basename = new_stem + ext
+
+        tags_to_add    = [m for m in matched if m["tag_id"] not in existing_tag_ids]
+        tags_already   = [m for m in matched if m["tag_id"] in existing_tag_ids]
+        all_tag_ids    = list(existing_tag_ids | {m["tag_id"] for m in matched})
+
+        has_token_tag_changes  = len(tags_to_add) > 0
+        has_filename_changes   = new_basename != basename_orig
+
+        # ── Directory classification ──────────────────────────────────────────
+        dir_class = classify_directory(path, studio_folder)
+
+        # ── MissingStudio handling ────────────────────────────────────────────
+        needs_missing_studio_tag = (
+            studio is None
+            and missing_studio_tag_id not in existing_tag_ids
+        )
+        if needs_missing_studio_tag:
+            all_tag_ids = list(set(all_tag_ids) | {missing_studio_tag_id})
+
+        # ── Decide whether this scene needs any action ────────────────────────
+        # A scene enters the pending list if ANY of:
+        #   • filename token changes
+        #   • tag changes (from tokens)
+        #   • directory needs fixing (wrong_studio / self_titled / shallow)
+        #   • MissingStudio tag needs adding
+        needs_dir_fix = dir_class in ("wrong_studio", "self_titled", "shallow")
+        if not has_token_tag_changes and not has_filename_changes \
+                and not needs_dir_fix and not needs_missing_studio_tag:
+            continue
+
+        # ── Build pending entry ───────────────────────────────────────────────
+
+        # Compute new_path (may be updated further in apply if user adjusts stem)
+        if has_filename_changes or needs_dir_fix:
+            if studio_folder and dir_class != "ok":
+                grandparent = os.path.dirname(file_dirname)
+                dest_dir    = os.path.join(grandparent, studio_folder)
+            else:
+                dest_dir    = file_dirname
+            new_path = os.path.join(dest_dir, new_stem + ext)
+        else:
+            new_path = path   # no file move needed
+
+        pending.append({
+            "scene_id":              scene["id"],
+            "scene_title":           scene.get("title") or basename_orig,
+            "file_id":               file["id"],
+            "original_path":         path,
+            "new_path":              new_path,
+            "original_stem":         stem,
+            "new_stem":              new_stem,
+            "matched_tokens":        matched,
+            "unmatched_tokens":      unmatched_sigil,
+            "stripped_unmatched":    strip_unmatched,
+            "tags_to_add":           tags_to_add,
+            "tags_already_on_scene": tags_already,
+            "all_tag_ids":           all_tag_ids,
+            "filename_changes":      has_filename_changes,
+            "studio_name":           studio_name,
+            "studio_folder":         studio_folder,
+            "rename_source":         rename_source,  # "metadata" | "tokens"
+            "year":                  year_meta,
+            # New fields
+            "dir_class":             dir_class,      # "ok"|"wrong_studio"|"self_titled"|"shallow"
+            "needs_dir_fix":         needs_dir_fix,
+            "needs_missing_studio":  needs_missing_studio_tag,
+            "missing_studio_tag_id": missing_studio_tag_id,
         })
 
     report = {
-        "status": "done",
-        "groups": report_groups,
-        "total_groups": len(report_groups),
-        "total_reclaimable_bytes": total_reclaimable,
-        "settings": {
-            "distance": distance,
-            "duration_diff": duration_diff,
-            "accuracy": accuracy_used,
-            "duration": duration_used,
-            "whitelist": whitelist,
-            "graylist": graylist,
-            "blacklist": blacklist,
-        },
+        "status":        "done",
+        "message":       f"Found {len(pending)} scenes needing attention.",
+        "progress":      100,
+        "total_scanned": len(all_scenes),
+        "pending":       pending,
+        "generated_at":  int(time.time()),
     }
     _write_report(report)
-    _write_status({"status": "done",
-                   "message": f"Found {len(report_groups)} duplicate groups.",
-                   "progress": 100})
-    log.info("Scan complete: %s groups, %.2f GB reclaimable",
-             len(report_groups), total_reclaimable / (1024 ** 3))
+    _write_status({
+        "status":   "done",
+        "message":  f"Scan complete. {len(pending)} scenes found.",
+        "progress": 100,
+    })
+    print(f"Scan complete. {len(pending)} scenes to sanitize.", flush=True)
 
 
-# ── Filename-length safety helper ──────────────────────────────────────────────
-DELETE_SUFFIX = ".delete"
-MAX_NAME_BYTES = 255  # ext4/xfs/apfs; lower for SMB/eCryptfs shares
+# ── Apply task ────────────────────────────────────────────────────────────────
 
-
-def _delete_would_overflow(path, suffix=DELETE_SUFFIX, limit=MAX_NAME_BYTES):
+def task_apply(url, apikey, args):
     """
-    True if Stash's soft-delete rename (append '.delete' to the basename) would
-    exceed the filesystem's per-component byte limit. The UI uses this to warn
-    and to trigger a rename-first fallback before deletion.
+    Apply a subset of the pending changes.
+    args["scene_ids"] = comma-separated IDs  OR  "all"
     """
-    base = os.path.basename((path or "").replace("\\", "/"))
-    return len(base.encode("utf-8")) + len(suffix.encode("utf-8")) > limit
+    scene_ids_arg = str(args.get("scene_ids", "all")).strip()
+
+    report_path = os.path.join(ASSETS_DIR, "sanitize_report.json")
+    if not os.path.exists(report_path):
+        print("No report found. Run Scan first.", flush=True)
+        sys.exit(1)
+
+    with open(report_path) as f:
+        report = json.load(f)
+
+    pending = report.get("pending", [])
+    if not pending:
+        print("Nothing to apply.", flush=True)
+        return
+
+    if scene_ids_arg == "all":
+        to_apply = pending
+    else:
+        ids_set  = set(scene_ids_arg.split(","))
+        to_apply = [p for p in pending if str(p["scene_id"]) in ids_set]
+
+    print(f"Applying {len(to_apply)} changes…", flush=True)
+    done, errors = 0, 0
+
+    for item in to_apply:
+        sid = item["scene_id"]
+        try:
+            # ── Determine effective destination path ──────────────────────────
+            orig_path    = item["original_path"]
+            orig_dir     = os.path.dirname(orig_path)
+            ext          = os.path.splitext(os.path.basename(orig_path))[1]
+            effective_stem = item["new_stem"]
+
+            studio_folder = item.get("studio_folder")
+            dir_class     = item.get("dir_class", "ok")
+
+            if studio_folder and dir_class != "ok":
+                grandparent = os.path.dirname(orig_dir)
+                dest_dir    = os.path.join(grandparent, studio_folder)
+            else:
+                dest_dir    = orig_dir
+
+            new_path = os.path.join(dest_dir, effective_stem + ext)
+
+            # ── Move file if path changed ─────────────────────────────────────
+            if orig_path != new_path:
+                ok = move_file(url, apikey, item["file_id"], new_path)
+                if not ok:
+                    print(f"  WARNING: moveFiles returned false for scene {sid}", flush=True)
+
+            # ── Update title ──────────────────────────────────────────────────
+            # When the rename came from existing metadata, the scene title is
+            # already correct — leave it intact. Only strip tag-tokens out of
+            # the title when we derived the name from the filename tokens.
+            original_title = item.get("scene_title", "")
+            if item.get("rename_source") == "metadata":
+                new_title = original_title
+            else:
+                new_title = original_title
+                strip_from_title = list(item.get("matched_tokens", []))
+                if item.get("stripped_unmatched"):
+                    strip_from_title.extend(item.get("unmatched_tokens", []))
+                # Also strip bracketed [ ... ] groups from the title.
+                new_title = BRACKET_GROUP_RE.sub(' ', new_title)
+                for tok in strip_from_title:
+                    new_title = re.sub(re.escape(tok["raw"]), '', new_title, flags=re.IGNORECASE)
+                new_title = re.sub(r'\s+', ' ', new_title).strip()
+                new_title = strip_tag_affixes(new_title)
+            if not new_title:
+                new_title = effective_stem
+
+            all_tag_ids = item.get("all_tag_ids", [])
+            update_scene(url, apikey, sid, new_title, all_tag_ids)
+
+            done += 1
+            print(f"  ✓ Scene {sid}: {os.path.basename(orig_path)} → {os.path.basename(new_path)}", flush=True)
+        except Exception as e:
+            errors += 1
+            print(f"  ✗ Scene {sid}: {e}", flush=True)
+
+    applied_ids = {item["scene_id"] for item in to_apply}
+    report["pending"] = [p for p in pending if p["scene_id"] not in applied_ids]
+    report["last_apply"] = {
+        "done":      done,
+        "errors":    errors,
+        "timestamp": int(time.time()),
+    }
+    _write_report(report)
+    print(f"Apply complete: {done} done, {errors} errors.", flush=True)
 
 
-# ── Tag task (optional convenience) ────────────────────────────────────────────
-def task_tag_duplicates(url, apikey, accuracy_label=None, duration_label=None):
-    """
-    Re-run the scan logic and apply the _DuplicateMarkForDeletion tag to every
-    non-keeper scene. Useful for users who prefer to review via Stash's normal
-    tag/library UI before deleting.
-    """
-    os.makedirs(ASSETS_DIR, exist_ok=True)
-    _write_status({"status": "running", "message": "Tagging duplicates...", "progress": 0})
-
-    cfg = get_configuration(url, apikey)
-    distance, accuracy_used = resolve_distance(accuracy_label, cfg)
-    duration_diff, duration_used = resolve_duration_diff(duration_label, cfg)
-    whitelist = _path_list(cfg.get("whitelist"))
-    graylist = _path_list(cfg.get("graylist"))
-    blacklist = _path_list(cfg.get("blacklist"))
-
-    log.info("tag: accuracy=%s(distance=%s) duration=%s(diff=%s)",
-             accuracy_used, distance, duration_used, duration_diff)
-
-    dup_tag = ensure_tag_exists(url, apikey, DUPLICATE_TAG_NAME)
-    groups = find_duplicate_scenes(url, apikey, distance, duration_diff)
-
-    tagged = 0
-    for scenes in groups:
-        scenes = [s for s in scenes if (s.get("files") or [])]
-        if len(scenes) < 2:
-            continue
-        keeper_idx = choose_keeper(scenes, whitelist, graylist, blacklist)
-        for i, s in enumerate(scenes):
-            if i == keeper_idx:
-                continue
-            existing = [t["id"] for t in (s.get("tags") or [])]
-            if dup_tag["id"] in existing:
-                continue
-            graphql_query(url, apikey, """
-                mutation SceneUpdate($input: SceneUpdateInput!) {
-                    sceneUpdate(input: $input) { id }
-                }
-            """, {"input": {"id": s["id"], "tag_ids": existing + [dup_tag["id"]]}})
-            tagged += 1
-
-    _write_status({"status": "done",
-                   "message": f"Tagged {tagged} duplicate scenes with {DUPLICATE_TAG_NAME}.",
-                   "progress": 100})
-    log.info("Tagged %s duplicate scenes", tagged)
-
-
-# ── Asset writers ─────────────────────────────────────────────────────────────
 def _write_status(data):
     os.makedirs(ASSETS_DIR, exist_ok=True)
-    with open(os.path.join(ASSETS_DIR, "dup_status.json"), "w") as f:
+    with open(os.path.join(ASSETS_DIR, "sanitize_status.json"), "w") as f:
         json.dump(data, f)
 
 
 def _write_report(data):
     os.makedirs(ASSETS_DIR, exist_ok=True)
-    with open(os.path.join(ASSETS_DIR, "dup_report.json"), "w") as f:
+    with open(os.path.join(ASSETS_DIR, "sanitize_report.json"), "w") as f:
         json.dump(data, f)
 
 
-# ── Arg parsing ───────────────────────────────────────────────────────────────
-def _extract_args(input_data):
-    """
-    Pull mode/accuracy/duration out of the plugin invocation. Stash passes
-    plugin-task args under 'args'; the UI (runPluginTask) sends them as a flat
-    dict. Falls back to the task name for menu-triggered runs.
-    """
-    raw_args = input_data.get("args", {})
-    if not isinstance(raw_args, dict):
-        raw_args = {}
-
-    mode = raw_args.get("mode", "")
-    accuracy = raw_args.get("accuracy")
-    duration = raw_args.get("duration")
-
-    task_name = mode or input_data.get("task", {}).get("name", "")
-    return task_name, accuracy, duration
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
     raw_stdin = sys.stdin.read()
     if not raw_stdin.strip():
         print("ERROR: stdin is empty.", flush=True)
         sys.exit(1)
-    input_data = json.loads(raw_stdin)
 
+    input_data        = json.loads(raw_stdin)
     server_connection = input_data.get("server_connection", {})
-    scheme = server_connection.get("Scheme", "http")
-    port = server_connection.get("Port", 9999)
-    apikey = server_connection.get("ApiKey", "")
+    scheme            = server_connection.get("Scheme", "http")
+    port              = server_connection.get("Port", 9999)
+    apikey            = server_connection.get("ApiKey", "")
 
     if not apikey:
-        cookie_obj = server_connection.get("SessionCookie", {})
-        cookie_name = cookie_obj.get("Name", "session")
+        cookie_obj   = server_connection.get("SessionCookie", {})
+        cookie_name  = cookie_obj.get("Name", "session")
         cookie_value = cookie_obj.get("Value", "")
         if cookie_value:
             global SESSION_COOKIE
@@ -543,40 +776,28 @@ def main():
 
     plugin_dir_from_stash = server_connection.get("PluginDir", "")
     if plugin_dir_from_stash:
-        # Prefer the script's own directory — it's physically inside the plugin
-        # folder that Stash serves at /plugin/<id>/assets/. PluginDir from the
-        # server connection can point elsewhere on some setups, which breaks the
-        # asset polling with a permanent 404.
         global PLUGIN_DIR, ASSETS_DIR
-        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-        if os.path.isdir(script_dir):
-            PLUGIN_DIR = script_dir
-        else:
-            plugin_dir_from_stash = server_connection.get("PluginDir", "")
-            if plugin_dir_from_stash:
-                PLUGIN_DIR = plugin_dir_from_stash
+        PLUGIN_DIR = plugin_dir_from_stash
         ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
         os.makedirs(ASSETS_DIR, exist_ok=True)
-        print(f"Writing assets to: {ASSETS_DIR}", flush=True)
 
     url = f"{scheme}://localhost:{port}/graphql"
 
-    task_name, accuracy, duration = _extract_args(input_data)
+    raw_args  = input_data.get("args", {})
+    task_name = raw_args.get("mode", "") if isinstance(raw_args, dict) else ""
+    if not task_name:
+        task_name = input_data.get("task", {}).get("name", "")
 
-    print(f"Task={task_name!r} accuracy={accuracy!r} duration={duration!r} PluginDir={PLUGIN_DIR!r}",
-          flush=True)
+    plugin_args = raw_args if isinstance(raw_args, dict) else {}
+    print(f"Task={task_name!r} PluginDir={PLUGIN_DIR!r}", flush=True)
 
-    try:
-        if task_name == "Scan for Duplicates":
-            task_scan(url, apikey, accuracy, duration)
-        elif task_name == "Tag Duplicates":
-            task_tag_duplicates(url, apikey, accuracy, duration)
-        else:
-            print(f"Unknown task: {task_name!r}", flush=True)
-            sys.exit(1)
-    except Exception as e:
-        log.exception("Task failed")
-        _write_status({"status": "error", "message": str(e)})
+    if task_name == "Scan for Dirty Filenames":
+        task_scan(url, apikey)
+    elif task_name == "Apply Sanitization":
+        task_apply(url, apikey, plugin_args)
+    else:
+        print(f"Unknown task: {task_name!r}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
